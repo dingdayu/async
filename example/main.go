@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/dingdayu/async"
+	"github.com/dingdayu/async/v2"
 )
 
 type ExampleAsync struct {
