@@ -49,7 +49,7 @@ func NewAsync(ctx context.Context, ch <-chan os.Signal) *Async {
 	ctx, cancel := context.WithCancel(ctx)
 
 	var wg sync.WaitGroup
-	var asy = Async{ctx: ctx, wg: &wg}
+	var asy = Async{ctx: ctx, wg: &wg, handles: map[string]HandleArg{}}
 
 	go func() {
 		// Wait for exit signal.
@@ -69,7 +69,13 @@ func NewAsync(ctx context.Context, ch <-chan os.Signal) *Async {
 }
 
 // Register register async handle
-func (a *Async) Register(call Handle) {
+func (a *Async) Register(call Handle) error {
+	defer func() {
+		if err := recover(); err != nil {
+			a.wg.Done()
+			err = errors.New("register error")
+		}
+	}()
 	a.wg.Add(1)
 
 	a.mu.Lock()
@@ -81,8 +87,13 @@ func (a *Async) Register(call Handle) {
 	handleArg.ctx, handleArg.cancel = context.WithCancel(a.ctx)
 	a.handles[call.Name()] = handleArg
 
+	// pre
+	a.handles[call.Name()].call.OnPreRun()
+
 	// run
 	go a.handles[call.Name()].call.Handle(handleArg.ctx, a.wg)
+
+	return nil
 }
 
 // UnRegister unregister async handle

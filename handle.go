@@ -6,11 +6,10 @@ import (
 	"sync"
 )
 
-// Shutdown async shutdown func
-type Shutdown func(s os.Signal)
-
+// Handle
 type Handle interface {
-	Name() string
+	Name() string // Don’t repeat, it will result in replacement
 	Handle(ctx context.Context, wg *sync.WaitGroup)
-	OnShutdown(s os.Signal)
+	OnPreRun()              // Before run, panic panic causes registration failure
+	OnShutdown(s os.Signal) // On Shutdown
 }
