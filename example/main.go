@@ -20,10 +20,12 @@ func (a ExampleAsync) OnPreRun() {
 	fmt.Printf("\u001B[1;30;42m[info]\u001B[0m ExampleAsync 注册成功，开始运行！\n")
 }
 
+// Name async name
 func (a ExampleAsync) Name() string {
 	return "example"
 }
 
+// Handle async logical
 func (a ExampleAsync) Handle(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -39,6 +41,7 @@ func (a ExampleAsync) Handle(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
+// OnShutdown on async shutdown
 func (a ExampleAsync) OnShutdown(s os.Signal) {
 	fmt.Printf("\u001B[1;30;42m[info]\u001B[0m ExampleAsync 接收到系统信号[%s]，准备退出！\n", s.String())
 }
