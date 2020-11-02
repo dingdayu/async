@@ -21,23 +21,27 @@ package async
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 )
-
-// Handle async Handle
-type Handle func(ctx context.Context, wg *sync.WaitGroup)
-
-// Shutdown async shutdown func
-type Shutdown func(s os.Signal)
 
 // Async async
 type Async struct {
 	ctx context.Context
 	wg  *sync.WaitGroup
 
-	mu         sync.Mutex
-	onShutdown []Shutdown
+	mu sync.RWMutex
+
+	handlesSort []string
+	handles     map[string]HandleArg
+}
+
+// HandleArg handle arg: context, cancel
+type HandleArg struct {
+	call   Handle
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // NewAsync new async
@@ -48,29 +52,55 @@ func NewAsync(ctx context.Context, ch <-chan os.Signal) *Async {
 	var asy = Async{ctx: ctx, wg: &wg}
 
 	go func() {
+		// Wait for exit signal.
 		s := <-ch
-		for _, f := range asy.onShutdown {
-			go f(s)
-		}
 
+		asy.mu.RLock()
+		for _, handle := range asy.handles {
+			go handle.call.OnShutdown(s)
+		}
+		asy.mu.RUnlock()
+
+		// Notify context exit.
 		cancel()
 	}()
 
 	return &asy
 }
 
-// RegisterOnShutdown register func to shutdown before
-func (a *Async) RegisterOnShutdown(f Shutdown) {
-	a.mu.Lock()
-	a.onShutdown = append(a.onShutdown, f)
-	a.mu.Unlock()
-}
-
 // Register register async handle
-func (a *Async) Register(f Handle) {
+func (a *Async) Register(call Handle) {
 	a.wg.Add(1)
 
-	go f(a.ctx, a.wg)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.handlesSort = append(a.handlesSort, call.Name())
+
+	handleArg := HandleArg{call: call}
+	handleArg.ctx, handleArg.cancel = context.WithCancel(a.ctx)
+	a.handles[call.Name()] = handleArg
+
+	// run
+	go a.handles[call.Name()].call.Handle(handleArg.ctx, a.wg)
+}
+
+// UnRegister unregister async handle
+func (a *Async) UnRegister(handle Handle) error {
+	a.wg.Add(1)
+
+	if call, ok := a.handles[handle.Name()]; ok {
+		a.mu.Lock()
+
+		// cancel & shutdown
+		call.cancel()
+		call.call.OnShutdown(UnRegisterSignal{})
+
+		a.mu.Unlock()
+		return nil
+	}
+
+	return errors.New("not fund handle")
 }
 
 // Wait async wait
