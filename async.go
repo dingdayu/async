@@ -34,7 +34,7 @@ type Async struct {
 	mu sync.RWMutex
 
 	handlesSort []string
-	handles     map[string]HandleArg
+	handles     map[Handle]HandleArg
 }
 
 // HandleArg handle arg: context, cancel
@@ -49,15 +49,18 @@ func NewAsync(ctx context.Context, ch <-chan os.Signal) *Async {
 	ctx, cancel := context.WithCancel(ctx)
 
 	var wg sync.WaitGroup
-	var asy = Async{ctx: ctx, wg: &wg, handles: map[string]HandleArg{}}
+	var asy = Async{ctx: ctx, wg: &wg, handles: map[Handle]HandleArg{}}
 
 	go func() {
 		// Wait for exit signal.
 		s := <-ch
 
 		asy.mu.RLock()
-		for _, handle := range asy.handles {
-			go handle.call.OnShutdown(s)
+		for handle := range asy.handles {
+			handle := handle
+			go func() {
+				_ = asy.UnRegister(handle, s)
+			}()
 		}
 		asy.mu.RUnlock()
 
@@ -85,27 +88,30 @@ func (a *Async) Register(call Handle) error {
 
 	handleArg := HandleArg{call: call}
 	handleArg.ctx, handleArg.cancel = context.WithCancel(a.ctx)
-	a.handles[call.Name()] = handleArg
+	a.handles[call] = handleArg
 
 	// pre
-	a.handles[call.Name()].call.OnPreRun()
+	a.handles[call].call.OnPreRun()
 
 	// run
-	go a.handles[call.Name()].call.Handle(handleArg.ctx, a.wg)
+	go a.handles[call].call.Handle(Context{handleArg.ctx, a, call})
 
 	return nil
 }
 
 // UnRegister unregister async handle
-func (a *Async) UnRegister(handle Handle) error {
-	a.wg.Add(1)
+func (a *Async) UnRegister(handle Handle, s os.Signal) error {
 
-	if call, ok := a.handles[handle.Name()]; ok {
+	if call, ok := a.handles[handle]; ok {
 		a.mu.Lock()
 
 		// cancel & shutdown
 		call.cancel()
-		call.call.OnShutdown(UnRegisterSignal{})
+		call.call.OnShutdown(s)
+
+		// del in map
+		delete(a.handles, handle)
+		a.wg.Done()
 
 		a.mu.Unlock()
 		return nil

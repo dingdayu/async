@@ -2,10 +2,12 @@
 
 Safe asynchronous tasks by Go.
 
+Correctly handle internal exits in v3.
+
 ## Install 
 
 ```bash
-go get github.com/dingdayu/async/v2
+go get github.com/dingdayu/async/v3
 ```
 
 ## Example
@@ -18,17 +20,16 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
-	"github.com/dingdayu/async/v2"
+	"github.com/dingdayu/async/v3"
 )
 
 type ExampleAsync struct {
 }
 
-// OnPreRun: Before run, panic panic causes registration failure
+// OnPreRun Before run, panic panic causes registration failure
 func (a ExampleAsync) OnPreRun() {
 	fmt.Printf("\u001B[1;30;42m[info]\u001B[0m ExampleAsync 注册成功，开始运行！\n")
 }
@@ -39,15 +40,15 @@ func (a ExampleAsync) Name() string {
 }
 
 // Handle async logical
-func (a ExampleAsync) Handle(ctx context.Context, wg *sync.WaitGroup) {
-	defer wg.Done()
+func (a ExampleAsync) Handle(ctx async.Context) {
+	defer ctx.Exit()
 
 	for {
 		select {
 		default:
 			// todo:: Logical unit
 			time.Sleep(3 * time.Second)
-			fmt.Println(time.Now().Format("2006-01-02 15:04:05"))
+			fmt.Println("ExampleAsync", time.Now().Format("2006-01-02 15:04:05"))
 		case <-ctx.Done():
 			return
 		}
