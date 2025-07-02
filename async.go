@@ -15,7 +15,7 @@
 */
 
 /*
-	This is Safe asynchronous tasks by Go.
+This is Safe asynchronous tasks by Go.
 */
 package async
 
@@ -75,23 +75,35 @@ func NewAsync(ctx context.Context, ch <-chan os.Signal) *Async {
 func (a *Async) Register(call Handle) error {
 	defer func() {
 		if err := recover(); err != nil {
-			a.wg.Done()
-			err = errors.New("register error")
+			// Only call Done if Add was called and the handle was registered
+			a.mu.Lock()
+			if _, ok := a.handles[call]; ok {
+				a.wg.Done()
+				delete(a.handles, call)
+			}
+			a.mu.Unlock()
+			// err = errors.New("register error") // Not used
 		}
 	}()
-	a.wg.Add(1)
 
 	a.mu.Lock()
-	defer a.mu.Unlock()
-
+	// Prevent double registration
+	if _, exists := a.handles[call]; exists {
+		a.mu.Unlock()
+		return errors.New("handle already registered")
+	}
 	a.handlesSort = append(a.handlesSort, call.Name())
 
 	handleArg := HandleArg{call: call}
 	handleArg.ctx, handleArg.cancel = context.WithCancel(a.ctx)
 	a.handles[call] = handleArg
 
+	a.wg.Add(1) // Only increment after successful registration
+
 	// pre
 	a.handles[call].call.OnPreRun()
+
+	a.mu.Unlock()
 
 	// run
 	go a.handles[call].call.Handle(Context{handleArg.ctx, a, call})
@@ -101,10 +113,9 @@ func (a *Async) Register(call Handle) error {
 
 // UnRegister unregister async handle
 func (a *Async) UnRegister(handle Handle, s os.Signal) error {
-
-	if call, ok := a.handles[handle]; ok {
-		a.mu.Lock()
-
+	a.mu.Lock()
+	call, ok := a.handles[handle]
+	if ok {
 		// cancel & shutdown
 		call.cancel()
 		call.call.OnShutdown(s)
@@ -112,11 +123,10 @@ func (a *Async) UnRegister(handle Handle, s os.Signal) error {
 		// del in map
 		delete(a.handles, handle)
 		a.wg.Done()
-
 		a.mu.Unlock()
 		return nil
 	}
-
+	a.mu.Unlock()
 	return errors.New("not fund handle")
 }
 
