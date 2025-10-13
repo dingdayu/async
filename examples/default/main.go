@@ -8,11 +8,13 @@ import (
 	async "github.com/dingdayu/async/v4"
 )
 
-// This example shows registering tasks from different packages into DefaultAsync
-
+// DemoTask is a sample async task for demonstration.
 type DemoTask struct{}
 
+// Name returns the name of the DemoTask.
 func (d DemoTask) Name() string { return "demo" }
+
+// Handle runs the main logic of DemoTask.
 func (d DemoTask) Handle(ctx async.Context) {
 	defer ctx.Exit()
 	for i := 0; i < 3; i++ {
@@ -20,7 +22,11 @@ func (d DemoTask) Handle(ctx async.Context) {
 		time.Sleep(1 * time.Second)
 	}
 }
-func (d DemoTask) OnPreRun()                      {}
+
+// OnPreRun is called before DemoTask starts running.
+func (d DemoTask) OnPreRun() {}
+
+// OnShutdown is called when DemoTask is shutting down.
 func (d DemoTask) OnShutdown(ctx context.Context) { fmt.Println("DemoTask shutdown") }
 
 func main() {
