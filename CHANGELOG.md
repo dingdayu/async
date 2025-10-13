@@ -11,6 +11,11 @@ All notable changes to this project will be documented in this file.
 - Replaced custom logger with `slog` structured logger; users can inject their own logger using `WithLogger(*slog.Logger)` option.
 - Shutdown hooks are executed concurrently and awaited. Added `WithHookTimeout(time.Duration)` option to set a per-hook timeout.
 
+### Added
+
+- DefaultAsync: a global async instance for convenient cross-package task registration and coordination. Provides package-level Register/Wait functions for unified management, similar to prometheus.DefaultRegisterer.
+- examples/default/main.go to demonstrate DefaultAsync usage.
+
 ### Removed
 
 - `WithUseContextSignal` option removed; `NewAsync` always uses signal.NotifyContext to receive OS signals. Use `context` cancellation to trigger shutdown programmatically.
