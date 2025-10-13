@@ -1,16 +1,23 @@
 # async
 
-Safe asynchronous tasks by Go.
+Safe asynchronous tasks manager for Go.
 
-Correctly handle internal exits in v3.
+This small library helps you run multiple background tasks (called "handles" or "tasks"), coordinate shutdown, and execute hooks safely. It provides a lightweight interface-based API for advanced control and a convenient `Task` struct for quick use (like `cobra.Command` style convenience).
 
-## Install 
+## Install
 
 ```bash
-go get github.com/dingdayu/async/v3
+go get github.com/dingdayu/async/v4
 ```
 
-## Example
+## Quick start
+
+There are two simple ways to define a task:
+
+- Implement the `Handle` interface (advanced/flexible).
+- Use the provided `Task` struct and callbacks (convenient, fewer lines).
+
+### Using `Task` (recommended for most users)
 
 ```go
 package main
@@ -18,59 +25,67 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
-	"github.com/dingdayu/async/v3"
+	async "github.com/dingdayu/async/v4"
 )
 
-type ExampleAsync struct {
-}
-
-// OnPreRun Before run, panic panic causes registration failure
-func (a ExampleAsync) OnPreRun() {
-	fmt.Printf("\u001B[1;30;42m[info]\u001B[0m ExampleAsync 注册成功，开始运行！\n")
-}
-
-// Name async name
-func (a ExampleAsync) Name() string {
-	return "example"
-}
-
-// Handle async logical
-func (a ExampleAsync) Handle(ctx async.Context) {
-	defer ctx.Exit()
-
-	for {
-		select {
-		default:
-			// todo:: Logical unit
-			time.Sleep(3 * time.Second)
-			fmt.Println("ExampleAsync", time.Now().Format("2006-01-02 15:04:05"))
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// OnShutdown on async shutdown
-func (a ExampleAsync) OnShutdown(s os.Signal) {
-	fmt.Printf("\u001B[1;30;42m[info]\u001B[0m ExampleAsync 接收到系统信号[%s]，准备退出！\n", s.String())
-}
-
 func main() {
-	// Handle SIGINT and SIGTERM.
-	ch := make(chan os.Signal)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+	a := async.NewAsync(context.Background())
 
-	ayc := async.NewAsync(context.Background(), ch)
+	// create a simple Task from callbacks
+	t := async.NewTask("example", func(ctx async.Context) {
+		defer ctx.Exit()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				fmt.Println("task running")
+				time.Sleep(1 * time.Second)
+			}
+		}
+	}, async.WithTaskPreRun(func(){ fmt.Println("pre-run") }), async.WithTaskShutdown(func(ctx context.Context){ fmt.Println("shutdown") }))
 
-	_ = ayc.Register(ExampleAsync{})
-
-	ayc.Wait()
-	fmt.Println("[1;30;42m[info]\u001B[0m Task exited")
+	_ = a.Register(t)
+	a.Wait()
 }
-
 ```
+
+### Implementing `Handle` directly (advanced)
+
+```go
+type MyHandle struct{}
+func (h MyHandle) Name() string { return "my" }
+func (h MyHandle) Handle(ctx async.Context) { /* run loop and call ctx.Exit() to stop */ }
+func (h MyHandle) OnPreRun() { /* optional */ }
+func (h MyHandle) OnShutdown(ctx context.Context) { /* cleanup */ }
+
+// register
+// a := async.NewAsync(context.Background())
+// _ = a.Register(MyHandle{})
+```
+
+## Examples
+
+See the `examples/` folder for two separate runnable examples:
+
+- `examples/handle`: a `main.go` that demonstrates implementing `Handle` directly.
+- `examples/task`: a `main.go` that demonstrates using `NewTask` and its callbacks.
+
+Run them with:
+
+```bash
+# run the handle example
+go run ./examples/handle
+
+# run the task example
+go run ./examples/task
+```
+
+Why use `Task` vs `Handle`?
+
+- `Task` is a convenience struct for quick tasks. It reduces boilerplate when you only need a simple run loop and optional hooks.
+- `Handle` (interface) is more flexible for complex tasks that require internal state, methods, or embedding.
+
+Choose `Task` for quick prototypes and `Handle` when you need full control.

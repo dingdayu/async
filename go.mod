@@ -1,3 +1,3 @@
-module github.com/dingdayu/async/v3
+module github.com/dingdayu/async/v4
 
 go 1.15

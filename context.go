@@ -12,8 +12,8 @@ type Context struct {
 }
 
 func (c *Context) Exit() {
-	c.Context.Done()
-	_ = c.async.UnRegister(c.handle, ExitSignal{})
+	// Unregister the handle; no signal to pass.
+	_ = c.async.UnRegister(c.handle)
 }
 
 func (c *Context) Done() <-chan struct{} {
