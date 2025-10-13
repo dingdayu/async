@@ -16,7 +16,7 @@ func TestNewAsync(t *testing.T) {
 func TestAsync_RegisterOnShutdown(t *testing.T) {
 	asy := NewAsync()
 	asy.RegisterOnShutdown(func(ctx context.Context) {
-		return
+		// no-op
 	})
 	if len(asy.onShutdown) != 1 {
 		t.Error("RegisterOnShutdown() Shutdown register error")

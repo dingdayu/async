@@ -1,3 +1,5 @@
+package async
+
 /*
    Copyright [2020] dingdayu <https://github.com/dingdayu>
 
@@ -13,11 +15,6 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 */
-
-/*
-This is Safe asynchronous tasks by Go.
-*/
-package async
 
 import (
 	"context"

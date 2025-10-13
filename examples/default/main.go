@@ -24,8 +24,8 @@ func (d DemoTask) OnPreRun()                      {}
 func (d DemoTask) OnShutdown(ctx context.Context) { fmt.Println("DemoTask shutdown") }
 
 func main() {
-	async.Register(DemoTask{})
-	async.Register(async.NewTask("quick", func(ctx async.Context) {
+	_ = async.Register(DemoTask{})
+	_ = async.Register(async.NewTask("quick", func(ctx async.Context) {
 		defer ctx.Exit()
 		fmt.Println("Quick task running")
 	}))

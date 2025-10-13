@@ -10,14 +10,13 @@ linters:
   enable:
     - govet
     - staticcheck
-    - gofmt
-    - goimports
     - ineffassign
     - revive
-    - gosimple
     - unused
     - misspell
-    - typecheck
+    - gocyclo
+    - revive
+    - errcheck
   settings:
 
     revive:
