@@ -19,7 +19,7 @@ There are two simple ways to define a task:
 
 ### DefaultAsync: Global Task Registration
 
-For convenience, async provides a global instance `DefaultAsync` and package-level functions `Register` and `Wait`.
+For convenience, async provides a global instance `DefaultAsync` and package-level functions `Register`, `Start`, `Run`, and `Wait`.
 This allows you to register tasks from anywhere in your project, even across multiple packages, and manage them centrally—similar to `prometheus.DefaultRegisterer`.
 
 **Typical usage:**
@@ -31,8 +31,17 @@ import "github.com/dingdayu/async/v4"
 async.Register(MyHandle{})
 async.Register(async.NewTask("quick", func(ctx async.Context) { /* ... */ }))
 
-// In your main:
-async.Wait() // blocks until all registered tasks exit
+// In your main, either block:
+if err := async.Run(context.Background()); err != nil {
+	panic(err)
+}
+// or start asynchronously:
+stop, err := async.Start(context.Background())
+if err != nil {
+	panic(err)
+}
+defer stop()
+async.Wait()
 ```
 
 **When to use:**
@@ -57,7 +66,7 @@ import (
 )
 
 func main() {
-	a := async.NewAsync(context.Background())
+	a := async.NewAsync()
 
 	// create a simple Task from callbacks
 	t := async.NewTask("example", func(ctx async.Context) {
@@ -73,8 +82,14 @@ func main() {
 		}
 	}, async.WithTaskPreRun(func(){ fmt.Println("pre-run") }), async.WithTaskShutdown(func(ctx context.Context){ fmt.Println("shutdown") }))
 
-	_ = a.Register(t)
-	a.Wait()
+	if err := a.Register(t); err != nil {
+		panic(err)
+	}
+
+	// Run blocks until all registered handles exit, so no separate Wait call is required.
+	if err := a.Run(context.Background()); err != nil {
+		panic(err)
+	}
 }
 ```
 
@@ -88,8 +103,9 @@ func (h MyHandle) OnPreRun() { /* optional */ }
 func (h MyHandle) OnShutdown(ctx context.Context) { /* cleanup */ }
 
 // register
-// a := async.NewAsync(context.Background())
+// a := async.NewAsync()
 // _ = a.Register(MyHandle{})
+// _ = a.Run(ctx) // or call async.Start(ctx) + async.Wait() for asynchronous control
 ```
 
 ## Examples

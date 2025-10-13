@@ -9,7 +9,12 @@ import (
 )
 
 func main() {
-	ay := async.NewAsync(context.Background())
+	ay := async.NewAsync()
+	stop, err := ay.Start(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	defer stop()
 
 	t := async.NewTask("task1", func(ctx async.Context) {
 		defer ctx.Exit()
@@ -24,7 +29,9 @@ func main() {
 		}
 	}, async.WithTaskPreRun(func() { fmt.Println("Task pre-run") }), async.WithTaskShutdown(func(ctx context.Context) { fmt.Println("Task shutdown") }))
 
-	_ = ay.Register(t)
+	if err := ay.Register(t); err != nil {
+		panic(err)
+	}
 
 	ay.Wait()
 	fmt.Println("task example exited")

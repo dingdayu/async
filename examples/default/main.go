@@ -29,6 +29,8 @@ func main() {
 		defer ctx.Exit()
 		fmt.Println("Quick task running")
 	}))
-	async.Wait()
+	if err := async.Run(context.Background()); err != nil {
+		panic(err)
+	}
 	fmt.Println("DefaultAsync example exited")
 }

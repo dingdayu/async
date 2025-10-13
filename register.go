@@ -1,14 +1,18 @@
 package async
 
-import (
-	"context"
-)
+import "context"
 
 // DefaultAsync is a global async instance for convenience, similar to prometheus.DefaultRegisterer.
-var DefaultAsync *Async
+var DefaultAsync = NewAsync()
 
-func init() {
-	DefaultAsync = NewAsync(context.Background())
+// Start starts the DefaultAsync instance with the provided context.
+func Start(ctx context.Context) (func(), error) {
+	return DefaultAsync.Start(ctx)
+}
+
+// Run starts DefaultAsync and blocks until all handles exit.
+func Run(ctx context.Context) error {
+	return DefaultAsync.Run(ctx)
 }
 
 // Register registers a handle to DefaultAsync.

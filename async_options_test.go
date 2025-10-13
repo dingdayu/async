@@ -35,10 +35,9 @@ func (h bufHandler) WithGroup(name string) slog.Handler   { return h }
 // Note: WithUseContextSignal removed in v4; use context cancellation or signals to trigger shutdown.
 
 func TestRegister_DuplicateNameWarn(t *testing.T) {
-	ctx := context.Background()
 	bh := &bufHandler{buf: &bytes.Buffer{}}
 	logger := slog.New(bh)
-	asy := NewAsync(ctx, WithLogger(logger))
+	asy := NewAsync(WithLogger(logger))
 
 	h1 := &testHandle{name: "dup"}
 	h2 := &testHandle{name: "dup"}
@@ -57,6 +56,12 @@ func TestRegister_DuplicateNameWarn(t *testing.T) {
 	if !bytes.Contains([]byte(out), []byte("registering handle with duplicate Name")) {
 		t.Fatalf("expected duplicate name warning in logs, got: %s", out)
 	}
+
+	stop, err := asy.Start(context.Background())
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	stop()
 }
 
 func TestNewAsync_ChNil_NotifyContext(t *testing.T) {
@@ -65,17 +70,23 @@ func TestNewAsync_ChNil_NotifyContext(t *testing.T) {
 	bh := &bufHandler{buf: &bytes.Buffer{}}
 	logger := slog.New(bh)
 
-	asy := NewAsync(ctx, WithLogger(logger))
+	asy := NewAsync(WithLogger(logger))
 
 	th := &testHandle{name: "t-ctx"}
 	if err := asy.Register(th); err != nil {
 		t.Fatalf("register failed: %v", err)
 	}
 
+	stop, err := asy.Start(ctx)
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+
 	// cancel context triggers internal signal context
 	cancel()
 
 	asy.Wait()
+	stop()
 
 	if atomic.LoadInt32(&th.shutdownCalled) == 0 {
 		t.Fatalf("expected handle OnShutdown to be called when ch==nil and ctx canceled")
@@ -87,7 +98,7 @@ func TestShutdownHooksConcurrent(t *testing.T) {
 	bh := &bufHandler{buf: &bytes.Buffer{}}
 	logger := slog.New(bh)
 
-	asy := NewAsync(ctx, WithLogger(logger))
+	asy := NewAsync(WithLogger(logger))
 
 	order := make([]int32, 3)
 	var wg sync.WaitGroup
@@ -105,7 +116,13 @@ func TestShutdownHooksConcurrent(t *testing.T) {
 		wg.Done()
 	})
 
+	stop, err := asy.Start(ctx)
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+
 	// cancel context to trigger hooks
 	cancel()
 	wg.Wait()
+	stop()
 }

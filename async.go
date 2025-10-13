@@ -31,13 +31,19 @@ import (
 
 // Async async
 type Async struct {
-	ctx context.Context
-	wg  *sync.WaitGroup
-
 	mu sync.RWMutex
 
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	startOnce sync.Once
+	stopOnce  sync.Once
+	started   bool
+
+	wg *sync.WaitGroup
+
 	handlesSort []string
-	handles     map[Handle]HandleArg
+	handles     map[Handle]*HandleArg
 	onShutdown  []func(context.Context)
 
 	logger *slog.Logger
@@ -72,84 +78,177 @@ func WithHookTimeout(d time.Duration) Option {
 
 // HandleArg handle arg: context, cancel
 type HandleArg struct {
-	call   Handle
-	ctx    context.Context
-	cancel context.CancelFunc
+	call    Handle
+	ctx     context.Context
+	cancel  context.CancelFunc
+	started bool
 }
 
-// NewAsync new async
-func NewAsync(ctx context.Context, opts ...Option) *Async {
-	ctx, cancel := context.WithCancel(ctx)
-
+// NewAsync creates a new Async instance. Context is provided later via Run/Start.
+func NewAsync(opts ...Option) *Async {
 	var wg sync.WaitGroup
-	asy := Async{ctx: ctx, wg: &wg, handles: map[Handle]HandleArg{}, logger: newDefaultLogger()}
-	// apply options
+	asy := &Async{
+		wg:      &wg,
+		handles: map[Handle]*HandleArg{},
+		logger:  newDefaultLogger(),
+	}
 	for _, opt := range opts {
-		opt(&asy)
+		opt(asy)
 	}
 	asy.logger = ensureLogger(asy.logger)
+	return asy
+}
 
-	go func() {
-		// always create a signal-notify context to handle OS signals
-		sigCtx, sigCancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-		defer sigCancel()
+// Run starts the async manager and blocks until all handles exit.
+func (a *Async) Run(ctx context.Context) error {
+	stop, err := a.Start(ctx)
+	if err != nil {
+		return err
+	}
+	defer stop()
 
-		// wait for signal context cancellation
+	a.Wait()
+	return nil
+}
 
-		<-sigCtx.Done()
+// Start launches the async manager without waiting for handles to exit.
+func (a *Async) Start(ctx context.Context) (func(), error) {
+	if ctx == nil {
+		return nil, errors.New("context must not be nil")
+	}
 
-		// Make a snapshot of handles and shutdown hooks
-		asy.mu.RLock()
-		handles := make([]Handle, 0, len(asy.handles))
-		for h := range asy.handles {
+	a.mu.RLock()
+	alreadyStarted := a.started
+	a.mu.RUnlock()
+	if alreadyStarted {
+		return func() { a.Stop() }, nil
+	}
+
+	a.startOnce.Do(func() {
+		runCtx, cancel := context.WithCancel(ctx)
+
+		a.mu.Lock()
+		a.ctx = runCtx
+		a.cancel = cancel
+		a.started = true
+		a.mu.Unlock()
+
+		a.startPendingHandles()
+
+		go a.watchSignals(runCtx)
+	})
+
+	a.mu.RLock()
+	alreadyStarted = a.started
+	a.mu.RUnlock()
+	if !alreadyStarted {
+		return nil, errors.New("async failed to start")
+	}
+
+	return func() { a.Stop() }, nil
+}
+
+// Stop triggers shutdown and is safe to call multiple times.
+func (a *Async) Stop() {
+	a.mu.RLock()
+	started := a.started
+	a.mu.RUnlock()
+	if !started {
+		return
+	}
+	a.shutdown()
+}
+
+func (a *Async) watchSignals(ctx context.Context) {
+	sigCtx, sigCancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer sigCancel()
+
+	<-sigCtx.Done()
+	a.shutdown()
+}
+
+func (a *Async) startPendingHandles() {
+	a.mu.Lock()
+	if a.ctx == nil {
+		a.mu.Unlock()
+		return
+	}
+
+	pending := make([]*HandleArg, 0)
+	for _, arg := range a.handles {
+		if arg.started {
+			continue
+		}
+		arg.ctx, arg.cancel = context.WithCancel(a.ctx)
+		arg.started = true
+		pending = append(pending, arg)
+	}
+	a.mu.Unlock()
+
+	for _, arg := range pending {
+		go arg.call.Handle(Context{arg.ctx, a, arg.call})
+	}
+}
+
+func (a *Async) shutdown() {
+	a.stopOnce.Do(func() {
+		a.mu.Lock()
+		if !a.started {
+			a.mu.Unlock()
+			return
+		}
+
+		cancel := a.cancel
+		handles := make([]Handle, 0, len(a.handles))
+		for h := range a.handles {
 			handles = append(handles, h)
 		}
-		shutdowns := make([]func(context.Context), len(asy.onShutdown))
-		copy(shutdowns, asy.onShutdown)
-		asy.mu.RUnlock()
+		shutdowns := make([]func(context.Context), len(a.onShutdown))
+		copy(shutdowns, a.onShutdown)
+		timeout := a.hookTimeout
+		logger := a.logger
+		a.mu.Unlock()
 
-		asy.logger.Info("received shutdown")
+		if cancel != nil {
+			cancel()
+		}
 
-		// run registered shutdown hooks concurrently and wait for them to finish
+		logger.Info("received shutdown")
+
 		var hooksWg sync.WaitGroup
 		hooksWg.Add(len(shutdowns))
 		for _, fn := range shutdowns {
-			f := fn
+			hook := fn
 			go func() {
 				defer hooksWg.Done()
-				// enforce per-hook timeout if configured
-				timeout := asy.hookTimeout
-				if timeout <= 0 {
-					f(context.Background())
+				if hook == nil {
 					return
 				}
-				hookCtxTmp, cancel := context.WithTimeout(context.Background(), timeout)
+				if timeout <= 0 {
+					hook(context.Background())
+					return
+				}
+				hookCtx, cancel := context.WithTimeout(context.Background(), timeout)
 				defer cancel()
-				f(hookCtxTmp)
-				if hookCtxTmp.Err() == context.DeadlineExceeded {
-					asy.logger.Warn("shutdown hook timeout", slog.String("timeout", timeout.String()))
+				hook(hookCtx)
+				if hookCtx.Err() == context.DeadlineExceeded {
+					logger.Warn("shutdown hook timeout", slog.String("timeout", timeout.String()))
 				}
 			}()
 		}
 		hooksWg.Wait()
 
-		// concurrently unregister handles and wait
 		var unregWg sync.WaitGroup
 		unregWg.Add(len(handles))
 		for _, handle := range handles {
 			h := handle
 			go func() {
-				_ = asy.UnRegister(h)
-				unregWg.Done()
+				defer unregWg.Done()
+				_ = a.UnRegister(h)
 			}()
 		}
 		unregWg.Wait()
-
-		// Notify context exit.
-		cancel()
-	}()
-
-	return &asy
+	})
 }
 
 // Register register async handle
@@ -175,9 +274,7 @@ func (a *Async) Register(call Handle) error {
 		}
 	}()
 
-	// Prepare handleArg before acquiring lock to minimize locked time
-	handleArg := HandleArg{call: call}
-	handleArg.ctx, handleArg.cancel = context.WithCancel(a.ctx)
+	handleArg := &HandleArg{call: call}
 
 	a.mu.Lock()
 	// Prevent double registration (same Handle instance)
@@ -202,12 +299,21 @@ func (a *Async) Register(call Handle) error {
 
 	a.wg.Add(1) // increment after successful registration
 
+	// Determine whether to start immediately (if async already running)
+	var shouldStart bool
+	if a.started {
+		handleArg.ctx, handleArg.cancel = context.WithCancel(a.ctx)
+		handleArg.started = true
+		shouldStart = true
+	}
+
 	// pre (call under lock so concurrent UnRegister can't remove midway)
 	call.OnPreRun()
 	a.mu.Unlock()
 
-	// run with a copy of ctx and handle to avoid races on map key
-	go call.Handle(Context{handleArg.ctx, a, call})
+	if shouldStart {
+		go call.Handle(Context{handleArg.ctx, a, call})
+	}
 
 	a.logger.Info("registered handle", slog.String("name", name))
 	return nil
@@ -216,7 +322,7 @@ func (a *Async) Register(call Handle) error {
 // UnRegister unregister async handle
 func (a *Async) UnRegister(handle Handle) error {
 	a.mu.Lock()
-	call, ok := a.handles[handle]
+	handleArg, ok := a.handles[handle]
 	if !ok {
 		a.mu.Unlock()
 		return ErrHandleNotFound
@@ -237,7 +343,9 @@ func (a *Async) UnRegister(handle Handle) error {
 	a.mu.Unlock()
 
 	// cancel & shutdown - protect OnShutdown from panics
-	call.cancel()
+	if handleArg.cancel != nil {
+		handleArg.cancel()
+	}
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -245,7 +353,7 @@ func (a *Async) UnRegister(handle Handle) error {
 			}
 		}()
 		// call OnShutdown with a background context
-		call.call.OnShutdown(context.Background())
+		handleArg.call.OnShutdown(context.Background())
 	}()
 
 	a.logger.Info("unregistered handle", slog.String("name", name))

@@ -27,8 +27,12 @@ func (a ExampleAsync) OnPreRun()                      {}
 func (a ExampleAsync) OnShutdown(ctx context.Context) { fmt.Println("ExampleAsync: shutdown") }
 
 func main() {
-	a := async.NewAsync(context.Background())
-	_ = a.Register(ExampleAsync{})
-	a.Wait()
+	a := async.NewAsync()
+	if err := a.Register(ExampleAsync{}); err != nil {
+		panic(err)
+	}
+	if err := a.Run(context.Background()); err != nil {
+		panic(err)
+	}
 	fmt.Println("all tasks exited")
 }
