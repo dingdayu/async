@@ -17,6 +17,32 @@ There are two simple ways to define a task:
 - Implement the `Handle` interface (advanced/flexible).
 - Use the provided `Task` struct and callbacks (convenient, fewer lines).
 
+### DefaultAsync: Global Task Registration
+
+For convenience, async provides a global instance `DefaultAsync` and package-level functions `Register` and `Wait`.
+This allows you to register tasks from anywhere in your project, even across multiple packages, and manage them centrally—similar to `prometheus.DefaultRegisterer`.
+
+**Typical usage:**
+
+```go
+import "github.com/dingdayu/async/v4"
+
+// In any package:
+async.Register(MyHandle{})
+async.Register(async.NewTask("quick", func(ctx async.Context) { /* ... */ }))
+
+// In your main:
+async.Wait() // blocks until all registered tasks exit
+```
+
+**When to use:**
+
+- You want to register tasks from multiple packages/modules and manage them together.
+- You prefer not to manually manage Async instances.
+- You want a simple, global entry point for background jobs.
+
+See `examples/default/main.go` for a runnable demo.
+
 ### Using `Task` (recommended for most users)
 
 ```go
@@ -68,10 +94,11 @@ func (h MyHandle) OnShutdown(ctx context.Context) { /* cleanup */ }
 
 ## Examples
 
-See the `examples/` folder for two separate runnable examples:
+See the `examples/` folder for three separate runnable examples:
 
 - `examples/handle`: a `main.go` that demonstrates implementing `Handle` directly.
 - `examples/task`: a `main.go` that demonstrates using `NewTask` and its callbacks.
+- `examples/default`: a `main.go` that demonstrates registering tasks to the global `DefaultAsync` from any package.
 
 Run them with:
 
@@ -81,11 +108,15 @@ go run ./examples/handle
 
 # run the task example
 go run ./examples/task
+
+# run the DefaultAsync example
+go run ./examples/default
 ```
 
 Why use `Task` vs `Handle`?
 
 - `Task` is a convenience struct for quick tasks. It reduces boilerplate when you only need a simple run loop and optional hooks.
 - `Handle` (interface) is more flexible for complex tasks that require internal state, methods, or embedding.
+- `DefaultAsync` lets you register tasks globally from anywhere, making it easy to coordinate background jobs across packages.
 
-Choose `Task` for quick prototypes and `Handle` when you need full control.
+Choose `Task` for quick prototypes, `Handle` for full control, and `DefaultAsync` for global registration and coordination.
