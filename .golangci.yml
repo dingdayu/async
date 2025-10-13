@@ -1,0 +1,51 @@
+# yaml-language-server: $schema=https://json.schemastore.org/golangci-lint.json
+
+version: "2"
+
+run:
+  timeout: 5m
+  issues-exit-code: 1
+
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - gofmt
+    - goimports
+    - ineffassign
+    - revive
+    - gosimple
+    - unused
+    - misspell
+    - typecheck
+  settings:
+
+    revive:
+      confidence: 0.8
+      severity: warning
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: error-return
+        - name: error-naming
+        - name: exported
+          arguments:
+            - disable-stuttering-check
+        - name: if-return
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: var-declaration
+    staticcheck:
+      checks:
+        - "all"
+        - "-SA1019"
+    misspell:
+      locale: US
+
+formatters:
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/dingdayu/async
