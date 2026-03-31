@@ -14,17 +14,6 @@ source:
   format: tar.gz
   name_template: "{{ .ProjectName }}-{{ .Version }}"
   prefix_template: "{{ .ProjectName }}-{{ .Version }}/"
-  files:
-    - LICENSE
-    - README.md
-    - CHANGELOG.md
-    - CONTRIBUTING.md
-    - SECURITY.md
-    - go.mod
-    - "**/*.go"
-    - "examples/**"
-    - ".github/ISSUE_TEMPLATE/**"
-    - ".github/PULL_REQUEST_TEMPLATE.md"
 
 checksum:
   name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
