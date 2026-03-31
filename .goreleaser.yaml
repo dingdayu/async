@@ -1,0 +1,56 @@
+# .goreleaser.yaml for Go library v4
+version: 2
+project_name: async
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - skip: true
+
+source:
+  enabled: true
+  format: tar.gz
+  name_template: "{{ .ProjectName }}-{{ .Version }}"
+  prefix_template: "{{ .ProjectName }}-{{ .Version }}/"
+  files:
+    - LICENSE
+    - README.md
+    - CHANGELOG.md
+    - CONTRIBUTING.md
+    - SECURITY.md
+    - go.mod
+    - "**/*.go"
+    - "examples/**"
+    - ".github/ISSUE_TEMPLATE/**"
+    - ".github/PULL_REQUEST_TEMPLATE.md"
+
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  github:
+    owner: dingdayu
+    name: async
+  prerelease: auto
+  mode: replace
+  header: |
+    ## async {{ .Version }}
+
+    Safe asynchronous task management for Go applications.
+  footer: |
+    ---
+    Refer to [CHANGELOG.md](https://github.com/dingdayu/async/blob/v4/CHANGELOG.md) for detailed upgrade notes.
