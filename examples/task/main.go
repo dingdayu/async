@@ -10,7 +10,10 @@ import (
 
 func main() {
 	ay := async.NewAsync()
-	stop, err := ay.Start(context.Background())
+	runCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	// Start is non-blocking and returns a stop func for graceful shutdown.
+	stop, err := ay.Start(runCtx)
 	if err != nil {
 		panic(err)
 	}
@@ -33,6 +36,7 @@ func main() {
 		panic(err)
 	}
 
+	// Wait keeps main alive until the task exits via ctx.Exit().
 	ay.Wait()
 	fmt.Println("task example exited")
 }

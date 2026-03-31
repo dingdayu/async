@@ -26,7 +26,9 @@ import (
 	"time"
 )
 
-// Async async
+// Async manages handle lifecycle: registration, startup, shutdown hooks, and waiting.
+//
+// An Async instance is safe for concurrent use.
 type Async struct {
 	mu sync.RWMutex
 
@@ -48,10 +50,11 @@ type Async struct {
 	hookTimeout time.Duration
 }
 
-// package-level exported errors
 var (
+	// ErrHandleAlreadyRegistered is returned when registering the same Handle instance twice.
 	ErrHandleAlreadyRegistered = errors.New("handle already registered")
-	ErrHandleNotFound          = errors.New("handle not found")
+	// ErrHandleNotFound is returned when trying to unregister a handle that is not registered.
+	ErrHandleNotFound = errors.New("handle not found")
 )
 
 // Option configures Async created by NewAsync
@@ -73,12 +76,22 @@ func WithHookTimeout(d time.Duration) Option {
 
 // (signal injection removed)
 
-// HandleArg handle arg: context, cancel
+// HandleArg stores per-handle runtime state managed by Async.
+//
+// It is exported for backward compatibility and should be treated as internal state.
 type HandleArg struct {
 	call    Handle
 	ctx     context.Context
 	cancel  context.CancelFunc
 	started bool
+}
+
+type shutdownSnapshot struct {
+	cancel    context.CancelFunc
+	handles   []Handle
+	shutdowns []func(context.Context)
+	timeout   time.Duration
+	logger    *slog.Logger
 }
 
 // NewAsync creates a new Async instance. Context is provided later via Run/Start.
@@ -189,67 +202,87 @@ func (a *Async) startPendingHandles() {
 
 func (a *Async) shutdown() {
 	a.stopOnce.Do(func() {
-		a.mu.Lock()
-		if !a.started {
-			a.mu.Unlock()
+		snapshot, ok := a.snapshotShutdown()
+		if !ok {
 			return
 		}
 
-		cancel := a.cancel
-		handles := make([]Handle, 0, len(a.handles))
-		for h := range a.handles {
-			handles = append(handles, h)
-		}
-		shutdowns := make([]func(context.Context), len(a.onShutdown))
-		copy(shutdowns, a.onShutdown)
-		timeout := a.hookTimeout
-		logger := a.logger
-		a.mu.Unlock()
-
-		if cancel != nil {
-			cancel()
+		if snapshot.cancel != nil {
+			snapshot.cancel()
 		}
 
-		logger.Info("received shutdown")
-
-		var hooksWg sync.WaitGroup
-		hooksWg.Add(len(shutdowns))
-		for _, fn := range shutdowns {
-			hook := fn
-			go func() {
-				defer hooksWg.Done()
-				if hook == nil {
-					return
-				}
-				if timeout <= 0 {
-					hook(context.Background())
-					return
-				}
-				hookCtx, cancel := context.WithTimeout(context.Background(), timeout)
-				defer cancel()
-				hook(hookCtx)
-				if hookCtx.Err() == context.DeadlineExceeded {
-					logger.Warn("shutdown hook timeout", slog.String("timeout", timeout.String()))
-				}
-			}()
-		}
-		hooksWg.Wait()
-
-		var unregWg sync.WaitGroup
-		unregWg.Add(len(handles))
-		for _, handle := range handles {
-			h := handle
-			go func() {
-				defer unregWg.Done()
-				_ = a.UnRegister(h)
-			}()
-		}
-		unregWg.Wait()
+		snapshot.logger.Info("received shutdown")
+		a.runShutdownHooks(snapshot)
+		a.unregisterHandles(snapshot.handles)
 	})
 }
 
-// Register register async handle
+func (a *Async) snapshotShutdown() (*shutdownSnapshot, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if !a.started {
+		return nil, false
+	}
+
+	handles := make([]Handle, 0, len(a.handles))
+	for h := range a.handles {
+		handles = append(handles, h)
+	}
+
+	shutdowns := make([]func(context.Context), len(a.onShutdown))
+	copy(shutdowns, a.onShutdown)
+
+	return &shutdownSnapshot{
+		cancel:    a.cancel,
+		handles:   handles,
+		shutdowns: shutdowns,
+		timeout:   a.hookTimeout,
+		logger:    a.logger,
+	}, true
+}
+
+func (a *Async) runShutdownHooks(snapshot *shutdownSnapshot) {
+	var hooksWg sync.WaitGroup
+	hooksWg.Add(len(snapshot.shutdowns))
+	for _, fn := range snapshot.shutdowns {
+		hook := fn
+		go func() {
+			defer hooksWg.Done()
+			if hook == nil {
+				return
+			}
+			if snapshot.timeout <= 0 {
+				hook(context.Background())
+				return
+			}
+			hookCtx, cancel := context.WithTimeout(context.Background(), snapshot.timeout)
+			defer cancel()
+			hook(hookCtx)
+			if hookCtx.Err() == context.DeadlineExceeded {
+				snapshot.logger.Warn("shutdown hook timeout", slog.String("timeout", snapshot.timeout.String()))
+			}
+		}()
+	}
+	hooksWg.Wait()
+}
+
+func (a *Async) unregisterHandles(handles []Handle) {
+	var unregWg sync.WaitGroup
+	unregWg.Add(len(handles))
+	for _, handle := range handles {
+		h := handle
+		go func() {
+			defer unregWg.Done()
+			_ = a.UnRegister(h)
+		}()
+	}
+	unregWg.Wait()
+}
+
+// Register adds a handle to Async and starts it immediately when Async is already running.
 //
+// Handles should call ctx.Exit() when their work is complete so Wait can unblock.
 // Example usage with Task convenience helper:
 //
 //	t := NewTask("worker", func(ctx Context) {
@@ -316,7 +349,9 @@ func (a *Async) Register(call Handle) error {
 	return nil
 }
 
-// UnRegister unregister async handle
+// UnRegister removes a previously registered handle, cancels its context, and runs its shutdown callback.
+//
+// It returns ErrHandleNotFound when the handle is not currently registered.
 func (a *Async) UnRegister(handle Handle) error {
 	a.mu.Lock()
 	handleArg, ok := a.handles[handle]
@@ -358,7 +393,7 @@ func (a *Async) UnRegister(handle Handle) error {
 	return nil
 }
 
-// Wait async wait
+// Wait blocks until all currently registered handles have called Exit (or were unregistered).
 func (a *Async) Wait() {
 	a.wg.Wait()
 }

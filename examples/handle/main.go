@@ -39,7 +39,10 @@ func main() {
 	if err := a.Register(ExampleAsync{}); err != nil {
 		panic(err)
 	}
-	if err := a.Run(context.Background()); err != nil {
+	runCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// Run starts the manager and waits until ExampleAsync calls ctx.Exit().
+	if err := a.Run(runCtx); err != nil {
 		panic(err)
 	}
 	fmt.Println("all tasks exited")

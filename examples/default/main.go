@@ -30,11 +30,13 @@ func (d DemoTask) OnPreRun() {}
 func (d DemoTask) OnShutdown(ctx context.Context) { fmt.Println("DemoTask shutdown") }
 
 func main() {
+	// Package-level Register/Run use the shared async.DefaultAsync instance.
 	_ = async.Register(DemoTask{})
 	_ = async.Register(async.NewTask("quick", func(ctx async.Context) {
 		defer ctx.Exit()
 		fmt.Println("Quick task running")
 	}))
+	// Run blocks until every registered handle exits (ctx.Exit or explicit unregistration).
 	if err := async.Run(context.Background()); err != nil {
 		panic(err)
 	}
