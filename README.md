@@ -136,3 +136,33 @@ Why use `Task` vs `Handle`?
 - `DefaultAsync` lets you register tasks globally from anywhere, making it easy to coordinate background jobs across packages.
 
 Choose `Task` for quick prototypes, `Handle` for full control, and `DefaultAsync` for global registration and coordination.
+
+## Development
+
+We use a `Makefile` to manage common development tasks.
+
+- **Run tests:** `make test`
+- **Run linting:** `make lint`
+- **Run examples:** `make examples`
+
+The equivalent raw commands are:
+
+```bash
+go test ./...
+golangci-lint run
+go run ./examples/default
+```
+
+## Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details on our development workflow and how to submit a pull request.
+
+## Release
+
+This project uses [GoReleaser](https://goreleaser.com/) for releases. You can test the release process locally using:
+
+```bash
+make release-snapshot
+```
+
+The current maintenance line is `v4`, and the next planned maintenance release is `v4.2.0`.

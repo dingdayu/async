@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v4.2.0] - Unreleased
+
+### Added
+
+- Repository maintenance improvements:
+  - Added `.goreleaser.yaml` for library release automation.
+  - Added `Makefile` with common development targets (`test`, `lint`, `examples`, `release-snapshot`).
+  - Added public `CONTRIBUTING.md` guide.
+  - Added GitHub Issue and Pull Request templates.
+  - Updated `README.md` with development, contribution, and release instructions.
+
+### Changed
+
+- Improved exported API documentation and example comments for easier onboarding.
+- Refined internal shutdown orchestration in `async.go` without changing the v4 public API.
+
+## [v4.1.0] - 2026-03-31
+
 ## [v4] - 2025-10-13
 
 ### Changed
