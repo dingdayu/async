@@ -2,57 +2,95 @@
 
 Safe asynchronous tasks manager for Go.
 
-This small library helps you run multiple background tasks (called "handles" or "tasks"), coordinate shutdown, and execute hooks safely. It provides a lightweight interface-based API for advanced control and a convenient `Task` struct for quick use (like `cobra.Command` style convenience).
+This library helps you supervise long-running background services and finite jobs in Go. v5 replaces the old handle-based API with an explicit runtime model built around named tasks and `context.Context`.
 
 ## Install
 
 ```bash
-go get github.com/dingdayu/async/v4
+go get github.com/dingdayu/async/v5
 ```
 
 ## Quick start
 
-There are two simple ways to define a task:
+v5 models work with one primitive:
 
-- Implement the `Handle` interface (advanced/flexible).
-- Use the provided `Task` struct and callbacks (convenient, fewer lines).
+- `async.Runner`: `func(context.Context) error`
 
-### DefaultAsync: Global Task Registration
+You then wrap a runner as one of two task kinds:
 
-For convenience, async provides a global instance `DefaultAsync` and package-level functions `Register`, `Start`, `Run`, and `Wait`.
-This allows you to register tasks from anywhere in your project, even across multiple packages, and manage them centrally—similar to `prometheus.DefaultRegisterer`.
+- `async.Service(...)` for long-running workers that usually run until shutdown
+- `async.Job(...)` for finite work that completes and returns
+
+### Runtime
+
+Create an explicit runtime, add tasks, then either block with `Run` or use `Start` + `Shutdown` + `Wait` for manual lifecycle control.
+
+Jobs are executed through an internal worker pool by default so bursts of short-lived tasks can reuse goroutines more efficiently than spawning one goroutine per job. Use `async.WithJobPool(0)` if you want to disable pooling.
+
+If you need backpressure control for short jobs, you can also bound the pooled queue with `async.WithJobQueue(n)`. In that mode:
+
+- `Add(...)` blocks until queue capacity becomes available
+- `TryAdd(...)` returns immediately with `async.ErrJobQueueFull` when the queue is saturated
 
 **Typical usage:**
 
 ```go
-import "github.com/dingdayu/async/v4"
+import (
+	"context"
+	async "github.com/dingdayu/async/v5"
+)
 
-// In any package:
-async.Register(MyHandle{})
-async.Register(async.NewTask("quick", func(ctx async.Context) { /* ... */ }))
+rt := async.NewRuntime()
 
-// In your main, either block:
-if err := async.Run(context.Background()); err != nil {
+_ = rt.Add(async.Service("worker", func(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			// do work
+		}
+	}
+}))
+
+_ = rt.Add(async.Job("warm-cache", func(ctx context.Context) error {
+	// finite startup work
+	return nil
+}))
+
+if err := rt.Run(context.Background()); err != nil {
 	panic(err)
 }
-// or start asynchronously:
-stop, err := async.Start(context.Background())
-if err != nil {
-	panic(err)
-}
-defer stop()
-async.Wait()
 ```
 
-**When to use:**
+### Bounded queued jobs
 
-- You want to register tasks from multiple packages/modules and manage them together.
-- You prefer not to manually manage Async instances.
-- You want a simple, global entry point for background jobs.
+```go
+rt := async.NewRuntime(
+	async.WithJobPool(4),
+	async.WithJobQueue(32),
+)
 
-See `examples/default/main.go` for a runnable demo.
+err := rt.TryAdd(async.Job("send-email", func(ctx context.Context) error {
+	// short-lived work
+	return nil
+}))
+if errors.Is(err, async.ErrJobQueueFull) {
+	// decide whether to retry, drop, or apply upstream backpressure
+}
+```
 
-### Using `Task` (recommended for most users)
+**When to use Services:**
+
+- Consumers, pollers, stream processors, background sync loops
+- Any worker that should stay alive until shutdown
+
+**When to use Jobs:**
+
+- Warm-up tasks, migrations, one-off background work, startup probes
+- Finite work that should complete and return
+
+### Service example
 
 ```go
 package main
@@ -60,61 +98,73 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
-	async "github.com/dingdayu/async/v4"
+	async "github.com/dingdayu/async/v5"
 )
 
 func main() {
-	a := async.NewAsync()
+	rt := async.NewRuntime()
 
-	// create a simple Task from callbacks
-	t := async.NewTask("example", func(ctx async.Context) {
-		defer ctx.Exit()
+	if err := rt.Add(async.Service("example", func(ctx context.Context) error {
 		for {
 			select {
 			case <-ctx.Done():
-				return
+				return nil
 			default:
 				fmt.Println("task running")
 				time.Sleep(1 * time.Second)
 			}
 		}
-	}, async.WithTaskPreRun(func(){ fmt.Println("pre-run") }), async.WithTaskShutdown(func(ctx context.Context){ fmt.Println("shutdown") }))
-
-	if err := a.Register(t); err != nil {
+	})); err != nil {
 		panic(err)
 	}
 
-	// Run blocks until all registered handles exit, so no separate Wait call is required.
-	if err := a.Run(context.Background()); err != nil {
+	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := rt.Run(runCtx); err != nil {
 		panic(err)
 	}
 }
 ```
 
-### Implementing `Handle` directly (advanced)
+### Manual lifecycle control
 
 ```go
-type MyHandle struct{}
-func (h MyHandle) Name() string { return "my" }
-func (h MyHandle) Handle(ctx async.Context) { /* run loop and call ctx.Exit() to stop */ }
-func (h MyHandle) OnPreRun() { /* optional */ }
-func (h MyHandle) OnShutdown(ctx context.Context) { /* cleanup */ }
+rt := async.NewRuntime()
+_ = rt.Add(async.Service("worker", runWorker))
 
-// register
-// a := async.NewAsync()
-// _ = a.Register(MyHandle{})
-// _ = a.Run(ctx) // or call async.Start(ctx) + async.Wait() for asynchronous control
+parentCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+defer stop()
+
+if err := rt.Start(parentCtx); err != nil {
+	panic(err)
+}
+
+<-parentCtx.Done()
+
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+if err := rt.Shutdown(shutdownCtx); err != nil {
+	panic(err)
+}
+
+if err := rt.Wait(); err != nil {
+	panic(err)
+}
 ```
 
 ## Examples
 
-See the `examples/` folder for three separate runnable examples:
+See the `examples/` folder for runnable v5 examples:
 
-- `examples/handle`: a `main.go` that demonstrates implementing `Handle` directly.
-- `examples/task`: a `main.go` that demonstrates using `NewTask` and its callbacks.
-- `examples/default`: a `main.go` that demonstrates registering tasks to the global `DefaultAsync` from any package.
+- `examples/handle`: a long-running service example.
+- `examples/task`: a runtime with explicit shutdown.
+- `examples/default`: a runtime mixing jobs and services.
 
 Run them with:
 
@@ -125,17 +175,24 @@ go run ./examples/handle
 # run the task example
 go run ./examples/task
 
-# run the DefaultAsync example
+# run the mixed runtime example
 go run ./examples/default
 ```
 
-Why use `Task` vs `Handle`?
+## v4 to v5 migration notes
 
-- `Task` is a convenience struct for quick tasks. It reduces boilerplate when you only need a simple run loop and optional hooks.
-- `Handle` (interface) is more flexible for complex tasks that require internal state, methods, or embedding.
-- `DefaultAsync` lets you register tasks globally from anywhere, making it easy to coordinate background jobs across packages.
+- `Handle` / `Context.Exit()` are removed from the core API.
+- Package-level global registration is removed from the core API.
+- Cleanup should use normal `defer` inside the runner.
+- `Wait()` now returns the first task error, if any.
+- Long-running workers should usually be modeled as `Service`, while finite work should be modeled as `Job`.
 
-Choose `Task` for quick prototypes, `Handle` for full control, and `DefaultAsync` for global registration and coordination.
+The first breaking release focuses on clearer lifecycle semantics, error propagation, and explicit runtime ownership.
+
+It also treats `Service` and `Job` differently on purpose:
+
+- `Service` is expected to keep running until shutdown. A clean early return is treated as a runtime failure.
+- `Job` is expected to finish by returning.
 
 ## Development
 
@@ -165,4 +222,4 @@ This project uses [GoReleaser](https://goreleaser.com/) for releases. You can te
 make release-snapshot
 ```
 
-The current maintenance line is `v4`, and the next planned maintenance release is `v4.2.0`.
+The active breaking-development line is `v5`.
