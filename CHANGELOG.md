@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v5.0.0] - Unreleased
+
+### Changed
+
+- Rebuilt the library around an explicit `Runtime` supervisor model.
+- Replaced the v4 handle-based API with `Runner`, `Task`, `Service`, and `Job`.
+- `Wait()` now returns runtime/task failures instead of acting as a pure blocker.
+- Removed the core global default runtime API in favor of explicit ownership.
+- Removed `Context.Exit()` and the `Handle` interface from the main API surface.
+- Runtime shutdown is now explicit through `Shutdown(ctx)` and task completion is modeled by returning from the runner.
+- `Service` now fails if it exits cleanly before shutdown, while `Job` remains finite work.
+
+### Added
+
+- `TaskError` for structured task failure reporting.
+- `WithFailFast(false)` to keep the runtime alive after individual task failures.
+- Dynamic `Add` support while the runtime is running.
+- `WithJobPool(...)` to reuse worker goroutines for short-lived jobs.
+
+### Removed
+
+- `Handle`, `Context`, `DefaultAsync`, package-level `Register/Run/Start/Wait`, and signal-driven core lifecycle handling.
+
 ## [v4.2.0] - Unreleased
 
 ### Added
