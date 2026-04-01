@@ -1,409 +1,437 @@
 package async
 
-/*
-   Copyright [2020] dingdayu <https://github.com/dingdayu>
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-*/
-
 import (
 	"context"
 	"errors"
-	"log/slog"
-	"os/signal"
+	"fmt"
+	goruntime "runtime"
+	"runtime/debug"
 	"sync"
-	"syscall"
-	"time"
 )
 
-// Async manages handle lifecycle: registration, startup, shutdown hooks, and waiting.
+var (
+	// ErrNilContext is returned when a nil context is passed to a lifecycle call.
+	ErrNilContext = errors.New("context must not be nil")
+	// ErrTaskNameRequired is returned when a task is added without a name.
+	ErrTaskNameRequired = errors.New("task name is required")
+	// ErrNilRunner is returned when a task has no runner function.
+	ErrNilRunner = errors.New("task runner must not be nil")
+	// ErrTaskAlreadyExists is returned when a task with the same name already exists.
+	ErrTaskAlreadyExists = errors.New("task already exists")
+	// ErrRuntimeNotStarted is returned when Wait is called before Start or Run.
+	ErrRuntimeNotStarted = errors.New("runtime not started")
+	// ErrRuntimeAlreadyEnded is returned when work is added after the runtime finishes.
+	ErrRuntimeAlreadyEnded = errors.New("runtime already ended")
+	// ErrRuntimeShuttingDown is returned when work is added during shutdown.
+	ErrRuntimeShuttingDown = errors.New("runtime is shutting down")
+	// ErrUnexpectedServiceExit is returned when a service exits cleanly before shutdown.
+	ErrUnexpectedServiceExit = errors.New("service returned before shutdown")
+	// ErrJobQueueFull is returned by TryAdd when the job queue is saturated.
+	ErrJobQueueFull = errors.New("job queue is full")
+)
+
+// Option configures a Runtime.
+type Option func(*Runtime)
+
+// WithFailFast controls whether the first task failure cancels the rest of the runtime.
+func WithFailFast(enabled bool) Option {
+	return func(r *Runtime) {
+		r.failFast = enabled
+	}
+}
+
+// WithJobPool configures how many worker goroutines execute queued jobs.
 //
-// An Async instance is safe for concurrent use.
-type Async struct {
-	mu sync.RWMutex
+// Set workers to 0 to disable pooling and run jobs in dedicated goroutines.
+func WithJobPool(workers int) Option {
+	if workers < 0 {
+		workers = 0
+	}
+	return func(r *Runtime) {
+		r.jobWorkers = workers
+	}
+}
+
+// WithJobQueue configures the maximum number of queued jobs waiting for a pool
+// worker.
+//
+// Set capacity to 0 for an unbounded queue.
+func WithJobQueue(capacity int) Option {
+	if capacity < 0 {
+		capacity = 0
+	}
+	return func(r *Runtime) {
+		r.jobQueueCap = capacity
+	}
+}
+
+// Runtime supervises named tasks and coordinates startup, failure handling, and shutdown.
+type Runtime struct {
+	mu sync.Mutex
+
+	failFast bool
+
+	started  bool
+	closed   bool
+	finished bool
 
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	startOnce sync.Once
-	stopOnce  sync.Once
-	started   bool
+	waitCh    chan struct{}
+	closeOnce sync.Once
 
-	wg *sync.WaitGroup
+	pending map[string]Task
+	running map[string]Kind
 
-	handlesSort []string
-	handles     map[Handle]*HandleArg
-	onShutdown  []func(context.Context)
+	runningCount int
+	firstErr     error
 
-	logger *slog.Logger
-	// per-hook timeout; zero means no timeout
-	hookTimeout time.Duration
+	jobWorkers  int
+	jobQueue    []Task
+	jobQueueCap int
+	jobCond     *sync.Cond
 }
 
-var (
-	// ErrHandleAlreadyRegistered is returned when registering the same Handle instance twice.
-	ErrHandleAlreadyRegistered = errors.New("handle already registered")
-	// ErrHandleNotFound is returned when trying to unregister a handle that is not registered.
-	ErrHandleNotFound = errors.New("handle not found")
-)
+// TaskError reports a task-level failure observed by Runtime.
+type TaskError struct {
+	Task  string
+	Kind  Kind
+	Cause error
+}
 
-// Option configures Async created by NewAsync
-type Option func(*Async)
+func (e *TaskError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("task %q (%s) failed: %v", e.Task, e.Kind.String(), e.Cause)
+}
 
-// WithLogger supplies a slog.Logger to Async (overrides default slog.Default()).
-func WithLogger(l *slog.Logger) Option {
-	return func(a *Async) {
-		if l != nil {
-			a.logger = l
+func (e *TaskError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func (k Kind) String() string {
+	if k == KindService {
+		return "service"
+	}
+	return "job"
+}
+
+// NewRuntime creates a new Runtime with the provided options.
+func NewRuntime(opts ...Option) *Runtime {
+	r := &Runtime{
+		failFast:   true,
+		waitCh:     make(chan struct{}),
+		pending:    make(map[string]Task),
+		running:    make(map[string]Kind),
+		jobWorkers: goruntime.GOMAXPROCS(0),
+	}
+	r.jobCond = sync.NewCond(&r.mu)
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
+}
+
+// NewAsync is kept as a compatibility alias for NewRuntime.
+func NewAsync(opts ...Option) *Runtime {
+	return NewRuntime(opts...)
+}
+
+// Add registers a task with the runtime.
+//
+// Tasks may be added before startup or while the runtime is running, but not
+// after shutdown has begun or after the runtime has finished.
+func (r *Runtime) Add(task Task) error {
+	return r.add(task, true)
+}
+
+// TryAdd registers a task without blocking on pooled job queue backpressure.
+//
+// For pooled jobs, TryAdd returns ErrJobQueueFull when the queue is at
+// capacity. Non-pooled tasks follow the same semantics as Add.
+func (r *Runtime) TryAdd(task Task) error {
+	return r.add(task, false)
+}
+
+func (r *Runtime) add(task Task, blockOnQueue bool) error {
+	if task.Name == "" {
+		return ErrTaskNameRequired
+	}
+	if task.Runner == nil {
+		return ErrNilRunner
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.finished {
+		return ErrRuntimeAlreadyEnded
+	}
+	if r.closed {
+		return ErrRuntimeShuttingDown
+	}
+	if _, exists := r.pending[task.Name]; exists {
+		return ErrTaskAlreadyExists
+	}
+	if _, exists := r.running[task.Name]; exists {
+		return ErrTaskAlreadyExists
+	}
+
+	if !r.started {
+		r.pending[task.Name] = task
+		return nil
+	}
+
+	return r.launchLocked(task, blockOnQueue)
+}
+
+// Start launches all pending tasks and begins supervising the runtime.
+func (r *Runtime) Start(parent context.Context) error {
+	if parent == nil {
+		return ErrNilContext
+	}
+
+	r.mu.Lock()
+	if r.finished {
+		r.mu.Unlock()
+		return ErrRuntimeAlreadyEnded
+	}
+	if r.started {
+		r.mu.Unlock()
+		return nil
+	}
+
+	r.started = true
+	r.ctx, r.cancel = context.WithCancel(parent)
+	r.startJobWorkersLocked()
+
+	for name, task := range r.pending {
+		delete(r.pending, name)
+		if err := r.launchLocked(task, true); err != nil {
+			r.pending[name] = task
+			break
 		}
 	}
-}
 
-// WithHookTimeout sets a per-hook timeout for shutdown hooks. If zero, hooks run without timeout.
-func WithHookTimeout(d time.Duration) Option {
-	return func(a *Async) { a.hookTimeout = d }
-}
-
-// (signal injection removed)
-
-// HandleArg stores per-handle runtime state managed by Async.
-//
-// It is exported for backward compatibility and should be treated as internal state.
-type HandleArg struct {
-	call    Handle
-	ctx     context.Context
-	cancel  context.CancelFunc
-	started bool
-}
-
-type shutdownSnapshot struct {
-	cancel    context.CancelFunc
-	handles   []Handle
-	shutdowns []func(context.Context)
-	timeout   time.Duration
-	logger    *slog.Logger
-}
-
-// NewAsync creates a new Async instance. Context is provided later via Run/Start.
-func NewAsync(opts ...Option) *Async {
-	var wg sync.WaitGroup
-	asy := &Async{
-		wg:      &wg,
-		handles: map[Handle]*HandleArg{},
-		logger:  newDefaultLogger(),
+	if r.runningCount == 0 {
+		r.finished = true
 	}
-	for _, opt := range opts {
-		opt(asy)
+	finished := r.finished
+	r.mu.Unlock()
+
+	if finished {
+		r.closeWait()
 	}
-	asy.logger = ensureLogger(asy.logger)
-	return asy
+	return nil
 }
 
-// Run starts the async manager and blocks until all handles exit.
-func (a *Async) Run(ctx context.Context) error {
-	stop, err := a.Start(ctx)
-	if err != nil {
+// Run starts the runtime and waits for it to finish.
+func (r *Runtime) Run(ctx context.Context) error {
+	if err := r.Start(ctx); err != nil {
 		return err
 	}
-	defer stop()
+	return r.Wait()
+}
 
-	a.Wait()
+// Shutdown requests runtime shutdown and waits until running tasks return or the
+// shutdown context expires.
+func (r *Runtime) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		return ErrNilContext
+	}
+
+	r.mu.Lock()
+	if r.finished {
+		err := r.firstErr
+		r.mu.Unlock()
+		return err
+	}
+	if !r.started {
+		r.closed = true
+		r.finished = true
+		err := r.firstErr
+		r.mu.Unlock()
+		r.closeWait()
+		return err
+	}
+
+	var cancel context.CancelFunc
+	if !r.closed {
+		r.closed = true
+		cancel = r.cancel
+		r.jobCond.Broadcast()
+	}
+	if r.runningCount == 0 {
+		r.finished = true
+	}
+	finished := r.finished
+	waitCh := r.waitCh
+	r.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if finished {
+		r.closeWait()
+		r.mu.Lock()
+		err := r.firstErr
+		r.mu.Unlock()
+		return err
+	}
+
+	select {
+	case <-waitCh:
+		r.mu.Lock()
+		err := r.firstErr
+		r.mu.Unlock()
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Wait blocks until the runtime reaches its terminal state and returns the
+// first task failure, if any.
+func (r *Runtime) Wait() error {
+	r.mu.Lock()
+	if !r.started && !r.finished {
+		r.mu.Unlock()
+		return ErrRuntimeNotStarted
+	}
+	waitCh := r.waitCh
+	r.mu.Unlock()
+
+	<-waitCh
+
+	r.mu.Lock()
+	err := r.firstErr
+	r.mu.Unlock()
+	return err
+}
+
+func (r *Runtime) startJobWorkersLocked() {
+	if r.jobWorkers <= 0 || r.ctx == nil {
+		return
+	}
+	for i := 0; i < r.jobWorkers; i++ {
+		go r.jobWorker()
+	}
+}
+
+func (r *Runtime) launchLocked(task Task, blockOnQueue bool) error {
+	if task.Kind == KindJob && r.jobWorkers > 0 {
+		if err := r.enqueueJobLocked(task, blockOnQueue); err != nil {
+			return err
+		}
+		r.runningCount++
+		r.running[task.Name] = task.Kind
+		return nil
+	}
+
+	r.runningCount++
+	r.running[task.Name] = task.Kind
+	ctx := r.ctx
+	go r.execute(ctx, task)
 	return nil
 }
 
-// Start launches the async manager without waiting for handles to exit.
-func (a *Async) Start(ctx context.Context) (func(), error) {
-	if ctx == nil {
-		return nil, errors.New("context must not be nil")
-	}
-
-	a.mu.RLock()
-	alreadyStarted := a.started
-	a.mu.RUnlock()
-	if alreadyStarted {
-		return func() { a.Stop() }, nil
-	}
-
-	a.startOnce.Do(func() {
-		runCtx, cancel := context.WithCancel(ctx)
-
-		a.mu.Lock()
-		a.ctx = runCtx
-		a.cancel = cancel
-		a.started = true
-		a.mu.Unlock()
-
-		a.startPendingHandles()
-
-		go a.watchSignals(runCtx)
-	})
-
-	a.mu.RLock()
-	alreadyStarted = a.started
-	a.mu.RUnlock()
-	if !alreadyStarted {
-		return nil, errors.New("async failed to start")
-	}
-
-	return func() { a.Stop() }, nil
-}
-
-// Stop triggers shutdown and is safe to call multiple times.
-func (a *Async) Stop() {
-	a.mu.RLock()
-	started := a.started
-	a.mu.RUnlock()
-	if !started {
-		return
-	}
-	a.shutdown()
-}
-
-func (a *Async) watchSignals(ctx context.Context) {
-	sigCtx, sigCancel := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-	defer sigCancel()
-
-	<-sigCtx.Done()
-	a.shutdown()
-}
-
-func (a *Async) startPendingHandles() {
-	a.mu.Lock()
-	if a.ctx == nil {
-		a.mu.Unlock()
-		return
-	}
-
-	pending := make([]*HandleArg, 0)
-	for _, arg := range a.handles {
-		if arg.started {
-			continue
+func (r *Runtime) enqueueJobLocked(task Task, blockOnQueue bool) error {
+	for {
+		if r.finished {
+			return ErrRuntimeAlreadyEnded
 		}
-		arg.ctx, arg.cancel = context.WithCancel(a.ctx)
-		arg.started = true
-		pending = append(pending, arg)
-	}
-	a.mu.Unlock()
-
-	for _, arg := range pending {
-		go arg.call.Handle(Context{arg.ctx, a, arg.call})
+		if r.closed {
+			return ErrRuntimeShuttingDown
+		}
+		if r.jobQueueCap <= 0 || len(r.jobQueue) < r.jobQueueCap {
+			r.jobQueue = append(r.jobQueue, task)
+			r.jobCond.Signal()
+			return nil
+		}
+		if !blockOnQueue {
+			return ErrJobQueueFull
+		}
+		r.jobCond.Wait()
 	}
 }
 
-func (a *Async) shutdown() {
-	a.stopOnce.Do(func() {
-		snapshot, ok := a.snapshotShutdown()
-		if !ok {
+func (r *Runtime) jobWorker() {
+	for {
+		r.mu.Lock()
+		for len(r.jobQueue) == 0 && !r.finished {
+			r.jobCond.Wait()
+		}
+		if len(r.jobQueue) == 0 && r.finished {
+			r.mu.Unlock()
 			return
 		}
+		task := r.jobQueue[0]
+		r.jobQueue[0] = Task{}
+		r.jobQueue = r.jobQueue[1:]
+		r.jobCond.Broadcast()
+		ctx := r.ctx
+		r.mu.Unlock()
 
-		if snapshot.cancel != nil {
-			snapshot.cancel()
-		}
+		r.execute(ctx, task)
+	}
+}
 
-		snapshot.logger.Info("received shutdown")
-		a.runShutdownHooks(snapshot)
-		a.unregisterHandles(snapshot.handles)
+func (r *Runtime) execute(ctx context.Context, task Task) {
+	err := runTask(ctx, task)
+
+	r.mu.Lock()
+	delete(r.running, task.Name)
+	r.runningCount--
+
+	if err != nil && r.firstErr == nil {
+		r.firstErr = &TaskError{Task: task.Name, Kind: task.Kind, Cause: err}
+	}
+
+	var cancel context.CancelFunc
+	if err != nil && r.failFast && !r.closed {
+		r.closed = true
+		cancel = r.cancel
+		r.jobCond.Broadcast()
+	}
+
+	if r.runningCount == 0 {
+		r.finished = true
+	}
+	finished := r.finished
+	r.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if finished {
+		r.closeWait()
+	}
+}
+
+func (r *Runtime) closeWait() {
+	r.closeOnce.Do(func() {
+		close(r.waitCh)
+		r.mu.Lock()
+		r.jobCond.Broadcast()
+		r.mu.Unlock()
 	})
 }
 
-func (a *Async) snapshotShutdown() (*shutdownSnapshot, bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if !a.started {
-		return nil, false
-	}
-
-	handles := make([]Handle, 0, len(a.handles))
-	for h := range a.handles {
-		handles = append(handles, h)
-	}
-
-	shutdowns := make([]func(context.Context), len(a.onShutdown))
-	copy(shutdowns, a.onShutdown)
-
-	return &shutdownSnapshot{
-		cancel:    a.cancel,
-		handles:   handles,
-		shutdowns: shutdowns,
-		timeout:   a.hookTimeout,
-		logger:    a.logger,
-	}, true
-}
-
-func (a *Async) runShutdownHooks(snapshot *shutdownSnapshot) {
-	var hooksWg sync.WaitGroup
-	hooksWg.Add(len(snapshot.shutdowns))
-	for _, fn := range snapshot.shutdowns {
-		hook := fn
-		go func() {
-			defer hooksWg.Done()
-			if hook == nil {
-				return
-			}
-			if snapshot.timeout <= 0 {
-				hook(context.Background())
-				return
-			}
-			hookCtx, cancel := context.WithTimeout(context.Background(), snapshot.timeout)
-			defer cancel()
-			hook(hookCtx)
-			if hookCtx.Err() == context.DeadlineExceeded {
-				snapshot.logger.Warn("shutdown hook timeout", slog.String("timeout", snapshot.timeout.String()))
-			}
-		}()
-	}
-	hooksWg.Wait()
-}
-
-func (a *Async) unregisterHandles(handles []Handle) {
-	var unregWg sync.WaitGroup
-	unregWg.Add(len(handles))
-	for _, handle := range handles {
-		h := handle
-		go func() {
-			defer unregWg.Done()
-			_ = a.UnRegister(h)
-		}()
-	}
-	unregWg.Wait()
-}
-
-// Register adds a handle to Async and starts it immediately when Async is already running.
-//
-// Handles should call ctx.Exit() when their work is complete so Wait can unblock.
-// Example usage with Task convenience helper:
-//
-//	t := NewTask("worker", func(ctx Context) {
-//	    defer ctx.Exit()
-//	    // work loop
-//	})
-//	_ = a.Register(t)
-func (a *Async) Register(call Handle) error {
+func runTask(ctx context.Context, task Task) (err error) {
 	defer func() {
-		if err := recover(); err != nil {
-			// Only call Done if Add was called and the handle was registered
-			a.mu.Lock()
-			if _, ok := a.handles[call]; ok {
-				a.wg.Done()
-				delete(a.handles, call)
-			}
-			a.mu.Unlock()
-			// err = errors.New("register error") // Not used
+		if rec := recover(); rec != nil {
+			err = fmt.Errorf("panic: %v\n%s", rec, string(debug.Stack()))
 		}
 	}()
 
-	handleArg := &HandleArg{call: call}
-
-	a.mu.Lock()
-	// Prevent double registration (same Handle instance)
-	if _, exists := a.handles[call]; exists {
-		a.mu.Unlock()
-		return ErrHandleAlreadyRegistered
+	err = task.Runner(ctx)
+	if err == nil && task.Kind == KindService && ctx.Err() == nil {
+		return ErrUnexpectedServiceExit
 	}
-
-	// Detect name collision with existing handles (different instance but same Name())
-	name := call.Name()
-	for h := range a.handles {
-		if h.Name() == name {
-			// warn but allow registration (keep existing logic)
-			a.logger.Warn("registering handle with duplicate Name", slog.String("name", name))
-			break
-		}
-	}
-
-	// Record in structures
-	a.handles[call] = handleArg
-	a.handlesSort = append(a.handlesSort, name)
-
-	a.wg.Add(1) // increment after successful registration
-
-	// Determine whether to start immediately (if async already running)
-	var shouldStart bool
-	if a.started {
-		handleArg.ctx, handleArg.cancel = context.WithCancel(a.ctx)
-		handleArg.started = true
-		shouldStart = true
-	}
-
-	// pre (call under lock so concurrent UnRegister can't remove midway)
-	call.OnPreRun()
-	a.mu.Unlock()
-
-	if shouldStart {
-		go call.Handle(Context{handleArg.ctx, a, call})
-	}
-
-	a.logger.Info("registered handle", slog.String("name", name))
-	return nil
-}
-
-// UnRegister removes a previously registered handle, cancels its context, and runs its shutdown callback.
-//
-// It returns ErrHandleNotFound when the handle is not currently registered.
-func (a *Async) UnRegister(handle Handle) error {
-	a.mu.Lock()
-	handleArg, ok := a.handles[handle]
-	if !ok {
-		a.mu.Unlock()
-		return ErrHandleNotFound
-	}
-
-	// remove from map and handlesSort
-	delete(a.handles, handle)
-	// remove first matching name from handlesSort
-	name := handle.Name()
-	for i, v := range a.handlesSort {
-		if v == name {
-			a.handlesSort = append(a.handlesSort[:i], a.handlesSort[i+1:]...)
-			break
-		}
-	}
-
-	// cancel while unlocked to avoid potential deadlocks, but keep call variable
-	a.mu.Unlock()
-
-	// cancel & shutdown - protect OnShutdown from panics
-	if handleArg.cancel != nil {
-		handleArg.cancel()
-	}
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				a.logger.Error("panic in OnShutdown", slog.String("name", name), slog.Any("panic", r))
-			}
-		}()
-		// call OnShutdown with a background context
-		handleArg.call.OnShutdown(context.Background())
-	}()
-
-	a.logger.Info("unregistered handle", slog.String("name", name))
-	a.wg.Done()
-	return nil
-}
-
-// Wait blocks until all currently registered handles have called Exit (or were unregistered).
-func (a *Async) Wait() {
-	a.wg.Wait()
-}
-
-// RegisterOnShutdown registers a function to be called when the async receives a shutdown signal.
-func (a *Async) RegisterOnShutdown(fn func(context.Context)) {
-	if fn == nil {
-		return
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.onShutdown = append(a.onShutdown, fn)
+	return err
 }
