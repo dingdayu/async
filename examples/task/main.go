@@ -3,40 +3,39 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
-	async "github.com/dingdayu/async/v4"
+	async "github.com/dingdayu/async/v5"
 )
 
 func main() {
-	ay := async.NewAsync()
-	runCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	// Start is non-blocking and returns a stop func for graceful shutdown.
-	stop, err := ay.Start(runCtx)
-	if err != nil {
-		panic(err)
-	}
-	defer stop()
-
-	t := async.NewTask("task1", func(ctx async.Context) {
-		defer ctx.Exit()
+	rt := async.NewRuntime()
+	if err := rt.Add(async.Service("task1", func(ctx context.Context) error {
 		for {
 			select {
 			case <-ctx.Done():
-				return
+				fmt.Println("Task shutdown")
+				return nil
 			default:
 				fmt.Println("Task running")
 				time.Sleep(500 * time.Millisecond)
 			}
 		}
-	}, async.WithTaskPreRun(func() { fmt.Println("Task pre-run") }), async.WithTaskShutdown(func(ctx context.Context) { fmt.Println("Task shutdown") }))
-
-	if err := ay.Register(t); err != nil {
+	})); err != nil {
 		panic(err)
 	}
 
-	// Wait keeps main alive until the task exits via ctx.Exit().
-	ay.Wait()
+	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	runCtx, cancel := context.WithTimeout(signalCtx, 3*time.Second)
+	defer cancel()
+
+	if err := rt.Run(runCtx); err != nil {
+		panic(err)
+	}
+
 	fmt.Println("task example exited")
 }
