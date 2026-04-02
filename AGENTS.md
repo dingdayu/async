@@ -11,6 +11,7 @@
 
 - Execute `go test ./...` before opening a pull request; this matches the guidance in the README quick-start section and ensures all packages compile.
 - Run `golangci-lint run` to mirror the CI workflow (`.github/workflows/golangci-lint.yml`). Fix lint issues before committing.
+- Run `make bench` when changing queueing, pooling, or partition behavior so you can compare runtime hot paths before and after the change.
 - For example programs, use `go run ./examples/<name>` to confirm they still produce the documented output.
 - If you add new runtime or task lifecycle behaviour, create focused tests under `async_test.go` using the synchronous `Run` API so the tests block until shutdown.
 - Update or add tests whenever behaviour changes—especially around shutdown, error propagation, and dynamic task management.

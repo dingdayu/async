@@ -20,17 +20,33 @@ You then wrap a runner as one of two task kinds:
 
 - `async.Service(...)` for long-running workers that usually run until shutdown
 - `async.Job(...)` for finite work that completes and returns
+- `async.JobWithPriority(...)` (or `async.Job(...).WithPriority(...)`) for finite work that should be queued ahead of lower-priority jobs
+- `async.JobInPartition(...)` (or `async.Job(...).WithPartition(...)`) for routing finite work to specific execution partitions
 
 ### Runtime
 
 Create an explicit runtime, add tasks, then either block with `Run` or use `Start` + `Shutdown` + `Wait` for manual lifecycle control.
 
-Jobs are executed through an internal worker pool by default so bursts of short-lived tasks can reuse goroutines more efficiently than spawning one goroutine per job. Use `async.WithJobPool(0)` if you want to disable pooling.
+**Tasks:**
 
-If you need backpressure control for short jobs, you can also bound the pooled queue with `async.WithJobQueue(n)`. In that mode:
+- `async.Service("name", runner)`: Long-running workers. If it returns `nil` before the context is canceled, it is considered an error (`ErrUnexpectedServiceExit`).
+- `async.Job("name", runner)`: Finite work. It is expected to return `nil` upon completion.
 
-- `Add(...)` blocks until queue capacity becomes available
-- `TryAdd(...)` returns immediately with `async.ErrJobQueueFull` when the queue is saturated
+**Job Pool and Backpressure:**
+
+Jobs are executed through an internal worker pool by default so bursts of short-lived tasks can reuse goroutines more efficiently than spawning one goroutine per job. 
+
+- `WithJobPool(n)`: Sets the number of worker goroutines (default is `GOMAXPROCS`). Use 0 to disable pooling.
+- `WithJobQueue(n)`: Sets the queue capacity. Default is unbounded (0).
+- `Add(task)`: Blocks until queue capacity becomes available if it's a pooled Job.
+- `TryAdd(task)`: Returns `async.ErrJobQueueFull` immediately if the queue is saturated.
+- `WithQueueFullPolicy(policy)`: Controls full-queue behavior for bounded pooled jobs.
+  - `QueueFullBlock` (default): `Add` blocks, `TryAdd` returns `ErrJobQueueFull`
+  - `QueueFullReject`: both `Add` and `TryAdd` return `ErrJobQueueFull`
+  - `QueueFullDropOldest`: drop the oldest queued job, then enqueue the new job
+  - `QueueFullDropNewest`: drop the newest queued job, then enqueue the new job
+- `WithJobPartition(name, config)`: Configures a named execution partition for jobs. Each partition has its own worker pool and queue settings.
+- Pooled job queues are priority-aware: higher `Task.Priority` values run first, while jobs with the same priority keep FIFO ordering.
 
 **Typical usage:**
 
@@ -69,6 +85,7 @@ if err := rt.Run(context.Background()); err != nil {
 rt := async.NewRuntime(
 	async.WithJobPool(4),
 	async.WithJobQueue(32),
+	async.WithQueueFullPolicy(async.QueueFullReject),
 )
 
 err := rt.TryAdd(async.Job("send-email", func(ctx context.Context) error {
@@ -79,6 +96,35 @@ if errors.Is(err, async.ErrJobQueueFull) {
 	// decide whether to retry, drop, or apply upstream backpressure
 }
 ```
+
+### Job Partitions
+
+Partitions allow you to isolate different types of background work. For example, you can have a "critical" partition with many workers and a "batch" partition with fewer workers.
+
+```go
+rt := async.NewRuntime(
+	async.WithJobPartition("batch", async.JobPartitionConfig{
+		Workers:  2,
+		QueueCap: 100,
+	}),
+)
+
+// Route a job to the partition
+_ = rt.Add(async.JobInPartition("process-video", "batch", func(ctx context.Context) error {
+	// ...
+	return nil
+}))
+
+// Or using WithPartition
+_ = rt.Add(async.Job("generate-report", func(ctx context.Context) error {
+	// ...
+	return nil
+}).WithPartition("batch"))
+```
+
+By default, jobs run in the `default` partition. Global settings like `WithJobPool` and `WithJobQueue` apply to the `default` partition.
+
+**Note:** The current implementation of partitions does not support worker stealing or global fairness across partitions. Each partition's queue and workers are independent.
 
 **When to use Services:**
 
@@ -194,12 +240,15 @@ It also treats `Service` and `Job` differently on purpose:
 - `Service` is expected to keep running until shutdown. A clean early return is treated as a runtime failure.
 - `Job` is expected to finish by returning.
 
+For a fuller migration guide, see [MIGRATION_v5.md](MIGRATION_v5.md).
+
 ## Development
 
 We use a `Makefile` to manage common development tasks.
 
 - **Run tests:** `make test`
 - **Run linting:** `make lint`
+- **Run benchmarks:** `make bench`
 - **Run examples:** `make examples`
 
 The equivalent raw commands are:
@@ -207,8 +256,16 @@ The equivalent raw commands are:
 ```bash
 go test ./...
 golangci-lint run
+go test ./... -run '^$' -bench 'BenchmarkRuntime' -benchmem
 go run ./examples/default
 ```
+
+The benchmark suite currently focuses on runtime/job hot paths:
+
+- plain Job execution versus pooled Job execution
+- priority-aware queue insertion
+- partitioned submission overhead
+- partition isolation under pressure
 
 ## Contributing
 
