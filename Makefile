@@ -1,4 +1,4 @@
-.PHONY: help test lint examples release-snapshot
+.PHONY: help test lint bench examples release-snapshot
 
 GO ?= go
 
@@ -9,6 +9,7 @@ help:
 	@echo "Targets:"
 	@echo "  test              Run all tests"
 	@echo "  lint              Run golangci-lint"
+	@echo "  bench             Run runtime benchmarks"
 	@echo "  examples          Run all example programs"
 	@echo "  release-snapshot  Run GoReleaser in snapshot mode"
 
@@ -17,6 +18,9 @@ test:
 
 lint:
 	golangci-lint run
+
+bench:
+	$(GO) test ./... -run '^$$' -bench 'BenchmarkRuntime' -benchmem
 
 examples:
 	@echo "Running handle example..."
