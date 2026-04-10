@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v5.1.1] - 2026-04-10
+
+### Changed
+
+- Added the missing changelog entry for the `v5.1.0` runtime update release.
+
+## [v5.1.0] - 2026-04-10
+
+### Added
+
+- Runtime observer hooks for task and lifecycle events.
+- Runtime stats snapshots for runtime and partition state.
+- Task middleware support at both runtime and per-task levels.
+- `llms.txt` guidance for LLM-assisted usage of the `v5` runtime.
+- `ROADMAP.md` to document the post-refactor development order.
+
+### Changed
+
+- Reworked pooled job priority handling to use a heap-backed local queue.
+- Split partition queue synchronization away from the global runtime mutex.
+- Clarified runtime layering, extension boundaries, and scheduling non-goals across the docs.
+- Hardened observer and middleware execution semantics around panic isolation and runtime stats meaning.
+
 ## [v5.0.0] - Unreleased
 
 ### Changed
