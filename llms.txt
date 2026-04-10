@@ -1,0 +1,193 @@
+# async for LLMs
+
+Project: `github.com/dingdayu/async/v5`
+Language: Go
+Purpose: supervise long-running services and finite background jobs with explicit runtime lifecycle control.
+
+## Core model
+
+- `Runner`: `func(context.Context) error`
+- `Task`: named unit of work managed by a `Runtime`
+- `Service(name, runner)`: long-running work that should stay alive until shutdown
+- `Job(name, runner)`: finite work that should complete and return
+- `Runtime`: owns task registration, startup, failure propagation, job pooling, and shutdown
+
+## Main APIs
+
+- `NewRuntime(opts ...Option) *Runtime`
+- `(*Runtime).Add(task Task) error`
+- `(*Runtime).TryAdd(task Task) error`
+- `(*Runtime).Start(ctx context.Context) error`
+- `(*Runtime).Run(ctx context.Context) error`
+- `(*Runtime).Shutdown(ctx context.Context) error`
+- `(*Runtime).Wait() error`
+- `(*Runtime).Stats() RuntimeStats`
+- `WithTaskMiddleware(middleware ...Middleware)`: register runtime-wide task wrappers
+- `task.WithMiddleware(middleware ...Middleware)`: wrap one task directly
+
+## Important options
+
+- `WithFailFast(bool)`: default `true`; first task failure cancels the runtime
+- `WithJobPool(n)`: number of workers for the default job partition; `0` disables pooling
+- `WithJobQueue(n)`: bounded queue size for pooled jobs; `0` means unbounded
+- `WithQueueFullPolicy(policy)`: controls behavior when a bounded pooled queue is full
+- `WithJobPartition(name, cfg)`: create isolated worker/queue settings for a named job partition
+- `WithObserver(observer...)`: subscribe to runtime/task lifecycle events
+
+## Queue full policies
+
+- `QueueFullBlock`: `Add` blocks, `TryAdd` returns `ErrJobQueueFull`
+- `QueueFullReject`: both reject when the queue is full
+- `QueueFullDropOldest`: oldest queued job is dropped
+- `QueueFullDropNewest`: newest queued job is dropped
+
+## Runtime semantics
+
+- Add tasks before `Start`/`Run` to register pending work.
+- Add tasks after `Start` to launch them dynamically.
+- Do not add tasks after shutdown begins.
+- `Run(ctx)` is `Start(ctx)` + `Wait()`.
+- `Shutdown(ctx)` cancels the runtime context and waits for running work to stop.
+- `Wait()` returns the first task error, if any.
+- A `Service` returning `nil` before shutdown is treated as `ErrUnexpectedServiceExit`.
+- Panics inside a runner are recovered and converted into errors.
+
+## Scheduling semantics
+
+- Jobs use the `default` partition unless `WithPartition` / `JobInPartition` is used.
+- Pooled job queues are priority-aware: higher `Priority` runs first.
+- Equal-priority pooled jobs preserve FIFO order.
+- Partitions are isolated. There is no work stealing across partitions.
+
+## Observability
+
+- `Stats()` returns runtime flags plus per-partition queue/worker state.
+- `RuntimeStats.Running` means currently executing tasks, not queued jobs.
+- Observers receive these event types:
+  - `runtime_started`
+  - `runtime_finished`
+  - `task_added`
+  - `task_queued`
+  - `task_started`
+  - `task_finished`
+  - `task_dropped`
+- Observer callbacks are isolated from runtime panic propagation, but generated code should still keep them lightweight and non-blocking.
+
+## Architecture guidance
+
+- **Core runtime layer**: lifecycle and supervision (`Runtime`, `Add`, `Run`, `Shutdown`, `Wait`)
+- **Control layer**: queueing, pooling, partitions, backpressure, priority
+- **Extension layer**: middleware, observers, stats snapshots
+
+When generating code or docs, preserve this separation instead of pushing logging/retry/metrics logic into runner scheduling internals.
+
+## Common usage patterns
+
+### Blocking runtime
+
+```go
+rt := async.NewRuntime()
+
+_ = rt.Add(async.Service("worker", func(ctx context.Context) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			// do background work
+		}
+	}
+}))
+
+_ = rt.Add(async.Job("warm-cache", func(ctx context.Context) error {
+	return nil
+}))
+
+if err := rt.Run(context.Background()); err != nil {
+	panic(err)
+}
+```
+
+### Manual lifecycle
+
+```go
+rt := async.NewRuntime()
+_ = rt.Add(async.Service("worker", runWorker))
+
+if err := rt.Start(parentCtx); err != nil {
+	panic(err)
+}
+
+shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+if err := rt.Shutdown(shutdownCtx); err != nil {
+	panic(err)
+}
+```
+
+### Partitioned jobs
+
+```go
+rt := async.NewRuntime(
+	async.WithJobPartition("batch", async.JobPartitionConfig{
+		Workers:  2,
+		QueueCap: 100,
+	}),
+)
+
+_ = rt.Add(async.Job("generate-report", runReport).WithPartition("batch"))
+```
+
+### Observer integration
+
+```go
+rt := async.NewRuntime(
+	async.WithObserver(async.ObserverFunc(func(event async.Event) {
+		log.Printf("type=%s task=%s err=%v", event.Type, event.Task.Name, event.Err)
+	})),
+)
+```
+
+### Middleware integration
+
+```go
+logging := func(task async.Task, next async.Runner) async.Runner {
+	return func(ctx context.Context) error {
+		log.Printf("start %s", task.Name)
+		err := next(ctx)
+		log.Printf("done %s err=%v", task.Name, err)
+		return err
+	}
+}
+
+rt := async.NewRuntime(async.WithTaskMiddleware(logging))
+_ = rt.Add(async.Job("warm-cache", runWarmCache).WithMiddleware(logging))
+```
+
+## Guidance for LLMs generating code
+
+- Prefer `Service` for loops, consumers, pollers, and workers that should live until shutdown.
+- Prefer `Job` for finite tasks, warmups, migrations, and one-off background work.
+- Always pass and honor `context.Context` in runners.
+- Use `Run(ctx)` for the simplest lifecycle.
+- Use `Start` + `Shutdown` + `Wait` when the caller already manages process signals or shutdown windows.
+- When generating examples with bounded queues, handle `ErrJobQueueFull` explicitly.
+- When generating examples with `Service`, return `nil` only after `ctx.Done()` fires.
+- Do not assume global runtime singletons; v5 is explicitly runtime-based.
+
+## Non-goals that generated code should respect
+
+- Do not invent runtime reboot/restart semantics after terminal shutdown.
+- Do not collapse `Service` and `Job` into one undifferentiated abstraction.
+- Do not assume global fairness or work stealing across partitions.
+- Do not hide task errors; callers should receive and handle them.
+- Do not introduce dynamic partition rebalancing unless the project explicitly asks for it.
+
+## Relevant files in this repo
+
+- `README.md`: end-user guide
+- `doc.go`: package overview
+- `async.go`: runtime implementation
+- `task.go`: task and runner definitions
+- `examples/default`, `examples/handle`, `examples/task`: runnable samples
