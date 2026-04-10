@@ -30,6 +30,7 @@ type Task struct {
 	// first. Jobs with the same priority keep FIFO order.
 	Priority int
 	Runner   Runner
+	mw       []Middleware
 }
 
 // Job creates a finite task.
@@ -64,6 +65,11 @@ func JobInPartition(name, partition string, run Runner) Task {
 func (t Task) WithPartition(partition string) Task {
 	t.Partition = partition
 	return t
+}
+
+// WithMiddleware returns a copy of task with middleware applied to its runner.
+func (t Task) WithMiddleware(middlewares ...Middleware) Task {
+	return WrapTask(t, middlewares...)
 }
 
 // Service creates a long-running task.

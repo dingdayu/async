@@ -170,6 +170,7 @@ type Runtime struct {
 	runningCount int
 	activeCount  int
 	firstErr     error
+	middlewares  []Middleware
 	observers    []Observer
 
 	jobPartitions map[string]*jobPartition
@@ -649,7 +650,11 @@ func (r *Runtime) waitClosed() bool {
 
 func (r *Runtime) execute(ctx context.Context, task Task) {
 	r.emitAll(Event{Type: EventTaskStarted, Task: task, Partition: normalizeJobPartition(task.Partition)})
-	err := runTask(ctx, task)
+	wrapped, wrapErr := r.wrapTask(task)
+	err := wrapErr
+	if err == nil {
+		err = runTask(ctx, wrapped)
+	}
 
 	r.mu.Lock()
 	delete(r.running, task.Name)
