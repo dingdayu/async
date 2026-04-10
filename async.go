@@ -1,6 +1,7 @@
 package async
 
 import (
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
@@ -73,7 +74,8 @@ type jobPartitionConfig struct {
 type jobPartition struct {
 	name string
 	jobPartitionConfig
-	queue      []queuedJob
+	mu         sync.Mutex
+	queue      queuedJobHeap
 	enqueueSeq uint64
 	cond       *sync.Cond
 }
@@ -166,7 +168,9 @@ type Runtime struct {
 	running map[string]Kind
 
 	runningCount int
+	activeCount  int
 	firstErr     error
+	observers    []Observer
 
 	jobPartitions map[string]*jobPartition
 }
@@ -174,6 +178,36 @@ type Runtime struct {
 type queuedJob struct {
 	task Task
 	seq  uint64
+}
+
+type queuedJobHeap []queuedJob
+
+func (h queuedJobHeap) Len() int {
+	return len(h)
+}
+
+func (h queuedJobHeap) Less(i, j int) bool {
+	if h[i].task.Priority != h[j].task.Priority {
+		return h[i].task.Priority > h[j].task.Priority
+	}
+	return h[i].seq < h[j].seq
+}
+
+func (h queuedJobHeap) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+}
+
+func (h *queuedJobHeap) Push(x interface{}) {
+	*h = append(*h, x.(queuedJob))
+}
+
+func (h *queuedJobHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	old[n-1] = queuedJob{}
+	*h = old[:n-1]
+	return item
 }
 
 // TaskError reports a task-level failure observed by Runtime.
@@ -221,14 +255,16 @@ func NewRuntime(opts ...Option) *Runtime {
 		running:       make(map[string]Kind),
 		jobPartitions: map[string]*jobPartition{DefaultJobPartition: defaultPartition},
 	}
-	defaultPartition.cond = sync.NewCond(&r.mu)
+	defaultPartition.cond = sync.NewCond(&defaultPartition.mu)
+	heap.Init(&defaultPartition.queue)
 	for _, opt := range opts {
 		opt(r)
 	}
 	for _, partition := range r.jobPartitions {
 		if partition.cond == nil {
-			partition.cond = sync.NewCond(&r.mu)
+			partition.cond = sync.NewCond(&partition.mu)
 		}
+		heap.Init(&partition.queue)
 	}
 	return r
 }
@@ -262,31 +298,52 @@ func (r *Runtime) add(task Task, blockOnQueue bool) error {
 		return ErrNilRunner
 	}
 
+	events := []Event{{
+		Type:      EventTaskAdded,
+		Task:      task,
+		Partition: normalizeJobPartition(task.Partition),
+	}}
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if r.finished {
+		r.mu.Unlock()
 		return ErrRuntimeAlreadyEnded
 	}
 	if r.closed {
+		r.mu.Unlock()
 		return ErrRuntimeShuttingDown
 	}
 	if _, exists := r.pending[task.Name]; exists {
+		r.mu.Unlock()
 		return ErrTaskAlreadyExists
 	}
 	if _, exists := r.running[task.Name]; exists {
+		r.mu.Unlock()
 		return ErrTaskAlreadyExists
 	}
-	if err := r.validateJobPartitionLocked(task); err != nil {
+	partition, err := r.validateJobPartitionLocked(task)
+	if err != nil {
+		r.mu.Unlock()
 		return err
 	}
 
 	if !r.started {
 		r.pending[task.Name] = task
+		r.mu.Unlock()
+		r.emitAll(events...)
 		return nil
 	}
+	r.reserveTaskLocked(task)
+	r.mu.Unlock()
 
-	return r.launchLocked(task, blockOnQueue)
+	launchEvents, err := r.launchReservedTask(task, partition, blockOnQueue)
+	if err != nil {
+		r.rollbackReservedTask(task.Name)
+		return err
+	}
+	r.emitAll(append(events, launchEvents...)...)
+	return nil
 }
 
 // Start launches all pending tasks and begins supervising the runtime.
@@ -305,23 +362,47 @@ func (r *Runtime) Start(parent context.Context) error {
 		return nil
 	}
 
+	events := []Event{{Type: EventRuntimeStarted}}
 	r.started = true
 	r.ctx, r.cancel = context.WithCancel(parent)
 	r.startJobWorkersLocked()
+	pendingTasks := make([]Task, 0, len(r.pending))
+	for _, task := range r.pending {
+		pendingTasks = append(pendingTasks, task)
+	}
+	r.pending = make(map[string]Task)
+	r.mu.Unlock()
 
-	for name, task := range r.pending {
-		delete(r.pending, name)
-		if err := r.launchLocked(task, true); err != nil {
-			r.pending[name] = task
+	for _, task := range pendingTasks {
+		r.mu.Lock()
+		partition, err := r.validateJobPartitionLocked(task)
+		if err != nil {
+			r.pending[task.Name] = task
+			r.mu.Unlock()
 			break
 		}
+		r.reserveTaskLocked(task)
+		r.mu.Unlock()
+
+		launchEvents, err := r.launchReservedTask(task, partition, true)
+		if err != nil {
+			r.rollbackReservedTask(task.Name)
+			r.mu.Lock()
+			r.pending[task.Name] = task
+			r.mu.Unlock()
+			break
+		}
+		events = append(events, launchEvents...)
 	}
+
+	r.mu.Lock()
 
 	if r.runningCount == 0 {
 		r.finished = true
 	}
 	finished := r.finished
 	r.mu.Unlock()
+	r.emitAll(events...)
 
 	if finished {
 		r.closeWait()
@@ -427,67 +508,73 @@ func (r *Runtime) startJobWorkersLocked() {
 	}
 }
 
-func (r *Runtime) launchLocked(task Task, blockOnQueue bool) error {
-	if task.Kind == KindJob {
-		partition, err := r.jobPartitionForTaskLocked(task)
-		if err != nil {
-			return err
-		}
-		if partition.workers > 0 {
-			if err := r.enqueueJobLocked(partition, task, blockOnQueue); err != nil {
-				return err
-			}
-			r.runningCount++
-			r.running[task.Name] = task.Kind
-			return nil
-		}
-
-		ctx := r.ctx
-		r.runningCount++
-		r.running[task.Name] = task.Kind
-		go r.execute(ctx, task)
-		return nil
+func (r *Runtime) launchReservedTask(task Task, partition *jobPartition, blockOnQueue bool) ([]Event, error) {
+	if task.Kind == KindJob && partition != nil && partition.workers > 0 {
+		return r.enqueueJob(partition, task, blockOnQueue)
 	}
 
-	r.runningCount++
-	r.running[task.Name] = task.Kind
-	ctx := r.ctx
-	go r.execute(ctx, task)
-	return nil
+	r.mu.Lock()
+	r.activeCount++
+	r.mu.Unlock()
+	go r.execute(r.ctx, task)
+	return nil, nil
 }
 
-func (r *Runtime) enqueueJobLocked(partition *jobPartition, task Task, blockOnQueue bool) error {
+func (r *Runtime) enqueueJob(partition *jobPartition, task Task, blockOnQueue bool) ([]Event, error) {
+	events := make([]Event, 0, 2)
 	for {
+		r.mu.Lock()
 		if r.finished {
-			return ErrRuntimeAlreadyEnded
+			r.mu.Unlock()
+			return nil, ErrRuntimeAlreadyEnded
 		}
 		if r.closed {
-			return ErrRuntimeShuttingDown
+			r.mu.Unlock()
+			return nil, ErrRuntimeShuttingDown
 		}
-		if partition.queueCap <= 0 || len(partition.queue) < partition.queueCap {
+		partition.mu.Lock()
+		if partition.queueCap <= 0 || partition.queue.Len() < partition.queueCap {
 			r.enqueueQueuedJobLocked(partition, task)
 			partition.cond.Signal()
-			return nil
+			partition.mu.Unlock()
+			r.mu.Unlock()
+			events = append(events, Event{Type: EventTaskQueued, Task: task, Partition: partition.name})
+			return events, nil
 		}
 
 		switch partition.queueFullPolicy {
 		case QueueFullReject:
-			return ErrJobQueueFull
+			partition.mu.Unlock()
+			r.mu.Unlock()
+			return nil, ErrJobQueueFull
 		case QueueFullDropOldest:
-			r.dropQueuedJobLocked(partition, r.findOldestQueuedJobIndexLocked(partition.queue))
+			dropped := r.dropQueuedJobLocked(partition, r.findOldestQueuedJobIndexLocked(partition.queue))
+			events = append(events, Event{Type: EventTaskDropped, Task: dropped, Partition: partition.name, QueueFullPolicy: partition.queueFullPolicy})
 			r.enqueueQueuedJobLocked(partition, task)
 			partition.cond.Signal()
-			return nil
+			partition.mu.Unlock()
+			r.mu.Unlock()
+			events = append(events, Event{Type: EventTaskQueued, Task: task, Partition: partition.name})
+			return events, nil
 		case QueueFullDropNewest:
-			r.dropQueuedJobLocked(partition, r.findNewestQueuedJobIndexLocked(partition.queue))
+			dropped := r.dropQueuedJobLocked(partition, r.findNewestQueuedJobIndexLocked(partition.queue))
+			events = append(events, Event{Type: EventTaskDropped, Task: dropped, Partition: partition.name, QueueFullPolicy: partition.queueFullPolicy})
 			r.enqueueQueuedJobLocked(partition, task)
 			partition.cond.Signal()
-			return nil
+			partition.mu.Unlock()
+			r.mu.Unlock()
+			events = append(events, Event{Type: EventTaskQueued, Task: task, Partition: partition.name})
+			return events, nil
 		default:
 			if !blockOnQueue {
-				return ErrJobQueueFull
+				partition.mu.Unlock()
+				r.mu.Unlock()
+				return nil, ErrJobQueueFull
 			}
+			r.mu.Unlock()
 			partition.cond.Wait()
+			partition.mu.Unlock()
+			continue
 		}
 	}
 }
@@ -495,21 +582,10 @@ func (r *Runtime) enqueueJobLocked(partition *jobPartition, task Task, blockOnQu
 func (r *Runtime) enqueueQueuedJobLocked(partition *jobPartition, task Task) {
 	queued := queuedJob{task: task, seq: partition.enqueueSeq}
 	partition.enqueueSeq++
-
-	insertAt := len(partition.queue)
-	for i, queuedTask := range partition.queue {
-		if queued.task.Priority > queuedTask.task.Priority {
-			insertAt = i
-			break
-		}
-	}
-
-	partition.queue = append(partition.queue, queuedJob{})
-	copy(partition.queue[insertAt+1:], partition.queue[insertAt:])
-	partition.queue[insertAt] = queued
+	heap.Push(&partition.queue, queued)
 }
 
-func (r *Runtime) findOldestQueuedJobIndexLocked(queue []queuedJob) int {
+func (r *Runtime) findOldestQueuedJobIndexLocked(queue queuedJobHeap) int {
 	oldestIndex := 0
 	oldestSeq := queue[0].seq
 	for i := 1; i < len(queue); i++ {
@@ -521,7 +597,7 @@ func (r *Runtime) findOldestQueuedJobIndexLocked(queue []queuedJob) int {
 	return oldestIndex
 }
 
-func (r *Runtime) findNewestQueuedJobIndexLocked(queue []queuedJob) int {
+func (r *Runtime) findNewestQueuedJobIndexLocked(queue queuedJobHeap) int {
 	newestIndex := 0
 	newestSeq := queue[0].seq
 	for i := 1; i < len(queue); i++ {
@@ -533,44 +609,52 @@ func (r *Runtime) findNewestQueuedJobIndexLocked(queue []queuedJob) int {
 	return newestIndex
 }
 
-func (r *Runtime) dropQueuedJobLocked(partition *jobPartition, index int) {
-	dropped := partition.queue[index].task
-	last := len(partition.queue) - 1
-	copy(partition.queue[index:], partition.queue[index+1:])
-	partition.queue[last] = queuedJob{}
-	partition.queue = partition.queue[:last]
+func (r *Runtime) dropQueuedJobLocked(partition *jobPartition, index int) Task {
+	dropped := heap.Remove(&partition.queue, index).(queuedJob).task
 
 	delete(r.running, dropped.Name)
 	r.runningCount--
+	return dropped
 }
 
 func (r *Runtime) jobWorker(partition *jobPartition) {
 	for {
-		r.mu.Lock()
-		for len(partition.queue) == 0 && !r.finished {
+		partition.mu.Lock()
+		for partition.queue.Len() == 0 {
+			if r.waitClosed() {
+				partition.mu.Unlock()
+				return
+			}
 			partition.cond.Wait()
 		}
-		if len(partition.queue) == 0 && r.finished {
-			r.mu.Unlock()
-			return
-		}
-		queued := partition.queue[0]
-		partition.queue[0] = queuedJob{}
-		partition.queue = partition.queue[1:]
+		queued := heap.Pop(&partition.queue).(queuedJob)
 		partition.cond.Broadcast()
-		ctx := r.ctx
-		r.mu.Unlock()
+		partition.mu.Unlock()
 
-		r.execute(ctx, queued.task)
+		r.mu.Lock()
+		r.activeCount++
+		r.mu.Unlock()
+		r.execute(r.ctx, queued.task)
+	}
+}
+
+func (r *Runtime) waitClosed() bool {
+	select {
+	case <-r.waitCh:
+		return true
+	default:
+		return false
 	}
 }
 
 func (r *Runtime) execute(ctx context.Context, task Task) {
+	r.emitAll(Event{Type: EventTaskStarted, Task: task, Partition: normalizeJobPartition(task.Partition)})
 	err := runTask(ctx, task)
 
 	r.mu.Lock()
 	delete(r.running, task.Name)
 	r.runningCount--
+	r.activeCount--
 
 	if err != nil && r.firstErr == nil {
 		r.firstErr = &TaskError{Task: task.Name, Kind: task.Kind, Cause: err}
@@ -588,6 +672,7 @@ func (r *Runtime) execute(ctx context.Context, task Task) {
 	}
 	finished := r.finished
 	r.mu.Unlock()
+	r.emitAll(Event{Type: EventTaskFinished, Task: task, Partition: normalizeJobPartition(task.Partition), Err: err})
 
 	if cancel != nil {
 		cancel()
@@ -598,12 +683,19 @@ func (r *Runtime) execute(ctx context.Context, task Task) {
 }
 
 func (r *Runtime) closeWait() {
+	closed := false
+	var err error
 	r.closeOnce.Do(func() {
 		close(r.waitCh)
 		r.mu.Lock()
 		r.broadcastJobPartitionsLocked()
+		err = r.firstErr
 		r.mu.Unlock()
+		closed = true
 	})
+	if closed {
+		r.emitAll(Event{Type: EventRuntimeFinished, Err: err})
+	}
 }
 
 func (r *Runtime) ensureJobPartition(name string) *jobPartition {
@@ -624,7 +716,8 @@ func (r *Runtime) ensureJobPartition(name string) *jobPartition {
 	if normalized == DefaultJobPartition {
 		partition.workers = goruntime.GOMAXPROCS(0)
 	}
-	partition.cond = sync.NewCond(&r.mu)
+	partition.cond = sync.NewCond(&partition.mu)
+	heap.Init(&partition.queue)
 	r.jobPartitions[normalized] = partition
 	return partition
 }
@@ -636,12 +729,11 @@ func normalizeJobPartition(name string) string {
 	return name
 }
 
-func (r *Runtime) validateJobPartitionLocked(task Task) error {
+func (r *Runtime) validateJobPartitionLocked(task Task) (*jobPartition, error) {
 	if task.Kind != KindJob {
-		return nil
+		return nil, nil
 	}
-	_, err := r.jobPartitionForTaskLocked(task)
-	return err
+	return r.jobPartitionForTaskLocked(task)
 }
 
 func (r *Runtime) jobPartitionForTaskLocked(task Task) (*jobPartition, error) {
@@ -659,7 +751,28 @@ func (r *Runtime) jobPartitionForTaskLocked(task Task) (*jobPartition, error) {
 
 func (r *Runtime) broadcastJobPartitionsLocked() {
 	for _, partition := range r.jobPartitions {
+		partition.mu.Lock()
 		partition.cond.Broadcast()
+		partition.mu.Unlock()
+	}
+}
+
+func (r *Runtime) reserveTaskLocked(task Task) {
+	r.runningCount++
+	r.running[task.Name] = task.Kind
+}
+
+func (r *Runtime) rollbackReservedTask(name string) {
+	r.mu.Lock()
+	delete(r.running, name)
+	r.runningCount--
+	if r.runningCount == 0 {
+		r.finished = true
+	}
+	finished := r.finished
+	r.mu.Unlock()
+	if finished {
+		r.closeWait()
 	}
 }
 
