@@ -22,6 +22,17 @@ You then wrap a runner as one of two task kinds:
 - `async.Job(...)` for finite work that completes and returns
 - `async.JobWithPriority(...)` (or `async.Job(...).WithPriority(...)`) for finite work that should be queued ahead of lower-priority jobs
 - `async.JobInPartition(...)` (or `async.Job(...).WithPartition(...)`) for routing finite work to specific execution partitions
+- `task.WithMiddleware(...)` or `WithTaskMiddleware(...)` for task wrappers such as logging, tracing, metrics, timeout, or retry
+
+## API layers
+
+The v5 runtime is intentionally organized into three layers:
+
+- **Core runtime layer**: `Runtime`, `Task`, `Runner`, `Job`, `Service`, `Add`, `TryAdd`, `Start`, `Run`, `Shutdown`, `Wait`
+- **Control layer**: pooling, queue capacity, queue full policy, partitions, priority
+- **Extension layer**: middleware/wrappers, observers, stats snapshots
+
+That split is intentional: the core stays small, control stays explicit, and cross-cutting behavior lives outside the scheduler hot path.
 
 ### Runtime
 
@@ -46,7 +57,18 @@ Jobs are executed through an internal worker pool by default so bursts of short-
   - `QueueFullDropOldest`: drop the oldest queued job, then enqueue the new job
   - `QueueFullDropNewest`: drop the newest queued job, then enqueue the new job
 - `WithJobPartition(name, config)`: Configures a named execution partition for jobs. Each partition has its own worker pool and queue settings.
+- `WithTaskMiddleware(middleware...)`: Registers runtime-wide task wrappers.
+- `WithObserver(observer...)`: Subscribes to runtime lifecycle events such as task queueing, start, finish, and queue drops.
 - Pooled job queues are priority-aware: higher `Task.Priority` values run first, while jobs with the same priority keep FIFO ordering.
+- Internally, pooled job partitions now use a heap-backed priority queue and per-partition synchronization to reduce contention while preserving the same public semantics.
+
+**Observability:**
+
+- `Runtime.Stats()` returns a point-in-time snapshot of runtime and partition state.
+- `RuntimeStats.Running` counts currently executing tasks; queued pooled jobs remain visible through partition `QueueLen`.
+- Observers receive `runtime_started`, `runtime_finished`, `task_added`, `task_queued`, `task_started`, `task_finished`, and `task_dropped` events.
+- `task_dropped` includes the `QueueFullPolicy` that caused the drop, which is useful when using `QueueFullDropOldest` or `QueueFullDropNewest`.
+- Observer panics are isolated from runtime control flow, but observers should still stay fast and non-blocking.
 
 **Typical usage:**
 
@@ -97,6 +119,48 @@ if errors.Is(err, async.ErrJobQueueFull) {
 }
 ```
 
+### Runtime observers
+
+```go
+rt := async.NewRuntime(
+	async.WithObserver(async.ObserverFunc(func(event async.Event) {
+		log.Printf("event=%s task=%s err=%v", event.Type, event.Task.Name, event.Err)
+	})),
+)
+
+_ = rt.Add(async.Job("warm-cache", func(ctx context.Context) error {
+	return nil
+}))
+
+if err := rt.Run(context.Background()); err != nil {
+	panic(err)
+}
+
+stats := rt.Stats()
+log.Printf("running=%d queued=%d", stats.Running, stats.Partitions[async.DefaultJobPartition].QueueLen)
+```
+
+### Task middleware
+
+```go
+logging := func(task async.Task, next async.Runner) async.Runner {
+	return func(ctx context.Context) error {
+		log.Printf("starting %s", task.Name)
+		err := next(ctx)
+		log.Printf("finished %s err=%v", task.Name, err)
+		return err
+	}
+}
+
+rt := async.NewRuntime(async.WithTaskMiddleware(logging))
+
+_ = rt.Add(async.Job("warm-cache", func(ctx context.Context) error {
+	return nil
+}))
+
+_ = rt.Add(async.Job("one-off", runOneOff).WithMiddleware(logging))
+```
+
 ### Job Partitions
 
 Partitions allow you to isolate different types of background work. For example, you can have a "critical" partition with many workers and a "batch" partition with fewer workers.
@@ -125,6 +189,19 @@ _ = rt.Add(async.Job("generate-report", func(ctx context.Context) error {
 By default, jobs run in the `default` partition. Global settings like `WithJobPool` and `WithJobQueue` apply to the `default` partition.
 
 **Note:** The current implementation of partitions does not support worker stealing or global fairness across partitions. Each partition's queue and workers are independent.
+
+## Explicit non-goals
+
+These are intentionally not part of the current design:
+
+- restarting or rebooting a finished runtime
+- removing the `Service` / `Job` distinction
+- global fairness scheduling across partitions
+- worker stealing across partitions
+- dynamic partition rebalancing
+- hiding task failures behind fire-and-forget APIs
+
+The runtime is meant to stay explicit about lifecycle, failure propagation, and partition isolation.
 
 **When to use Services:**
 
@@ -242,6 +319,8 @@ It also treats `Service` and `Job` differently on purpose:
 
 For a fuller migration guide, see [MIGRATION_v5.md](MIGRATION_v5.md).
 
+For the current development order after the v5 runtime refactor, see [ROADMAP.md](ROADMAP.md).
+
 ## Development
 
 We use a `Makefile` to manage common development tasks.
@@ -263,7 +342,7 @@ go run ./examples/default
 The benchmark suite currently focuses on runtime/job hot paths:
 
 - plain Job execution versus pooled Job execution
-- priority-aware queue insertion
+- heap-backed priority queue submission
 - partitioned submission overhead
 - partition isolation under pressure
 

@@ -1,5 +1,9 @@
 # Future scheduling directions for v5+
 
+This document defines the scheduler boundary and long-term deferred areas.
+
+For the active near-term development order, see [ROADMAP.md](ROADMAP.md).
+
 The current v5 runtime stops at:
 
 - explicit `Runtime` lifecycle
@@ -9,6 +13,7 @@ The current v5 runtime stops at:
 - queue-full policies
 - priority-aware local queues
 - partitioned job execution
+- middleware / observer / stats extension points around the core runtime
 
 This is the intentional boundary for the current branch.
 
@@ -21,6 +26,14 @@ The runtime now gives users three important guarantees:
 3. isolation between job partitions
 
 Adding global fairness or work stealing would weaken those guarantees unless the runtime becomes a more sophisticated scheduler.
+
+The current refactor also intentionally strengthens encapsulation:
+
+- the **core runtime layer** remains lifecycle-oriented
+- the **control layer** owns pooling, queueing, partitions, and backpressure
+- the **extension layer** owns wrappers, observers, and stats
+
+That split should continue. Future work should prefer extension hooks over pushing more policy into the scheduler core.
 
 ## Benchmark signals that would justify a deeper scheduler
 
@@ -52,6 +65,9 @@ These should remain out of the current v5 line:
 - soft quotas backed by a global scheduler
 - dynamic partition rebalancing
 - worker stealing that ignores partition-local queue policy
+- runtime reboot/restart after a terminal state
+- collapsing `Service` and `Job` into a single ambiguous task kind
+- removing explicit task errors in favor of silent fire-and-forget execution
 
 ## Risks to watch if borrowing is explored later
 
